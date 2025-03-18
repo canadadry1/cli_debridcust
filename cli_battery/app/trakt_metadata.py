@@ -164,24 +164,18 @@ class TraktMetadata:
             aliases = self._get_movie_aliases(slug)
             if aliases:
                 movie_data['aliases'] = aliases
+
+            # Get release dates and add them to the movie data
+            release_dates = self.get_release_dates(imdb_id)
+            if release_dates:
+                movie_data['release_dates'] = release_dates
                 
             return movie_data
         return None
 
     def get_show_seasons_and_episodes(self, imdb_id):
-        # First search to get the show's Trakt slug
-        logger.debug(f"Searching for show slug with IMDb ID: {imdb_id}")
-        search_result = self._search_by_imdb(imdb_id)
-        if not search_result or search_result['type'] != 'show':
-            logger.warning(f"Could not find show or invalid type for IMDb ID: {imdb_id}")
-            return None, None
-            
-        show = search_result['show']
-        slug = show['ids']['slug']
-        logger.debug(f"Found show slug: {slug}")
-        
-        # Now get the seasons data using the slug
-        url = f"{self.base_url}/shows/{slug}/seasons?extended=full,episodes"
+        # Get seasons data directly using IMDB ID
+        url = f"{self.base_url}/shows/{imdb_id}/seasons?extended=full,episodes"
         logger.debug(f"Fetching seasons data from: {url}")
         response = self._make_request(url)
         if response and response.status_code == 200:
@@ -360,7 +354,15 @@ class TraktMetadata:
         return "Posters not available through Trakt API"
 
     def get_release_dates(self, imdb_id):
-        url = f"{self.base_url}/movies/{imdb_id}/releases"
+        # First search to get the movie's Trakt slug
+        search_result = self._search_by_imdb(imdb_id)
+        if not search_result or search_result['type'] != 'movie':
+            return None
+            
+        movie = search_result['movie']
+        slug = movie['ids']['slug']
+
+        url = f"{self.base_url}/movies/{slug}/releases"
         response = self._make_request(url)
         if response and response.status_code == 200:
             releases = response.json()
@@ -372,9 +374,10 @@ class TraktMetadata:
                 if country and release_date:
                     try:
                         date = iso8601.parse_date(release_date)
-                        # Convert to UTC if necessary
+                        # Convert to local timezone if necessary
                         if date.tzinfo is not None:
-                            date = date.astimezone(timezone.utc)
+                            from metadata.metadata import _get_local_timezone
+                            date = date.astimezone(_get_local_timezone())
                         formatted_releases[country].append({
                             'date': date.date().isoformat(),
                             'type': release_type

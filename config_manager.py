@@ -9,6 +9,7 @@ from datetime import datetime
 from debrid import reset_provider
 from utilities.file_lock import FileLock
 import importlib
+from poster_cache import CACHE_FILE
 
 # Get the base config directory from an environment variable, with a fallback
 CONFIG_DIR = os.environ.get('USER_CONFIG', '/user/config')
@@ -49,19 +50,92 @@ def load_config():
     if not os.path.exists(CONFIG_FILE):
         return {}
     with open(CONFIG_FILE, 'r') as file:
-        with FileLock(file):
-            return json.load(file)
+        return json.load(file)
+
+def sync_plex_settings(config):
+    """Synchronize shared settings between Plex and File Management sections."""
+    # Initialize sections if they don't exist
+    if 'Plex' not in config:
+        config['Plex'] = {}
+    if 'File Management' not in config:
+        config['File Management'] = {}
+
+    # Define shared fields and their mappings
+    shared_fields = {
+        'Plex': {
+            'url': 'url',
+            'token': 'token'
+        },
+        'File Management': {
+            'plex_url_for_symlink': 'url',
+            'plex_token_for_symlink': 'token'
+        }
+    }
+
+    # Determine which section should take precedence based on file management mode
+    file_management = config.get('File Management', {}).get('file_collection_management', 'Plex')
+    primary_section = 'File Management' if file_management == 'Symlinked/Local' else 'Plex'
+    secondary_section = 'Plex' if primary_section == 'File Management' else 'File Management'
+
+    # Store original values before making any changes
+    original_values = {
+        'Plex': {k: config['Plex'].get(k, '') for k in shared_fields['Plex']},
+        'File Management': {k: config['File Management'].get(k, '') for k in shared_fields['File Management']}
+    }
+
+    # For each shared field name (url, token)
+    for shared_name in set(shared_fields['Plex'].values()):
+        # Get the corresponding fields in each section
+        plex_field = next(k for k, v in shared_fields['Plex'].items() if v == shared_name)
+        fm_field = next(k for k, v in shared_fields['File Management'].items() if v == shared_name)
+        
+        primary_value = original_values[primary_section][plex_field if primary_section == 'Plex' else fm_field]
+        secondary_value = original_values[secondary_section][plex_field if secondary_section == 'Plex' else fm_field]
+        
+        # If primary section has a value, use it
+        if primary_value:
+            if primary_section == 'Plex':
+                config['File Management'][fm_field] = primary_value
+            else:
+                config['Plex'][plex_field] = primary_value
+        # If only secondary section has a value, use it
+        elif secondary_value:
+            if secondary_section == 'Plex':
+                config['File Management'][fm_field] = secondary_value
+            else:
+                config['Plex'][plex_field] = secondary_value
+        # If both are empty, no action needed
+
+    return config
 
 def save_config(config):
-    with open(CONFIG_FILE, 'w') as file:
-        with FileLock(file):
-            json.dump(config, file, indent=4)
+    # Load previous config to check for TMDB API key changes
+    previous_config = load_config()
+    previous_tmdb_key = previous_config.get('TMDB', {}).get('api_key')
+    new_tmdb_key = config.get('TMDB', {}).get('api_key')
+
+    # Sync Plex settings between sections
+    config = sync_plex_settings(config)
+
+    # Check if TMDB API key has changed
+    if previous_tmdb_key != new_tmdb_key:
+        # Delete poster cache if it exists
+        if os.path.exists(CACHE_FILE):
             try:
-                from routes.base_routes import clear_cache
-                clear_cache()  # Clear the update check cache when settings are saved
-                #logging.debug("Cleared update check cache after saving settings")
+                os.remove(CACHE_FILE)
+                logging.info("Deleted poster cache due to TMDB API key change")
             except Exception as e:
-                logging.error(f"Error clearing update check cache: {str(e)}")
+                logging.error(f"Failed to delete poster cache: {e}")
+
+    # Save the new config
+    with open(CONFIG_FILE, 'w') as file:
+        json.dump(config, file, indent=4, default=json_serializer)
+    try:
+        from routes.base_routes import clear_cache
+        clear_cache()  # Clear the update check cache when settings are saved
+        #logging.debug("Cleared update check cache after saving settings")
+    except Exception as e:
+        logging.error(f"Error clearing update check cache: {str(e)}")
 
 def add_content_source(source_type, source_config):
     process_id = str(uuid.uuid4())[:8]
@@ -158,11 +232,16 @@ def delete_content_source(source_id):
         return False
 
 def update_content_source(source_id, source_config):
+    from content_checkers.plex_watchlist import validate_plex_tokens
+
     process_id = str(uuid.uuid4())[:8]
     logging.debug(f"[{process_id}] Starting update_content_source process for source_id: {source_id}")
     
     config = load_config()
     if 'Content Sources' in config and source_id in config['Content Sources']:
+        # Store the old config to check for changes
+        old_config = config['Content Sources'].get(source_id, {})
+        
         # Validate and update only the fields present in the schema
         source_type = source_id.split('_')[0]
         schema = SETTINGS_SCHEMA['Content Sources']['schema'][source_type]
@@ -177,8 +256,19 @@ def update_content_source(source_id, source_config):
                     elif not isinstance(value, list):
                         value = list(value)
                 config['Content Sources'][source_id][key] = value
+        
+        # If this is a Plex watchlist and the token has changed, validate it
+        if (source_config.get('type') == 'Other Plex Watchlist' and 
+            (old_config.get('token') != source_config.get('token') or 
+             old_config.get('username') != source_config.get('username'))):
+            token_status = validate_plex_tokens()
+            username = source_config.get('username')
+            if username in token_status and not token_status[username]['valid']:
+                logging.error(f"Invalid Plex token for newly added/updated user {username}")
+        
         log_config_state(f"[{process_id}] Config after updating content source", config)
         save_config(config)
+        
         # Explicitly reset provider and reinitialize components after content source update
         reset_provider()
         from queue_manager import QueueManager
@@ -261,7 +351,6 @@ def delete_scraper(scraper_id):
         return True
     return False
 
-# Add this function if it doesn't exist
 def save_version_settings(version, settings):
     config = load_config()
     if 'Scraping' not in config:
@@ -269,12 +358,20 @@ def save_version_settings(version, settings):
     if 'versions' not in config['Scraping']:
         config['Scraping']['versions'] = {}
     
-    # Ensure max_size_gb is properly handled
-    if 'max_size_gb' in settings:
-        if settings['max_size_gb'] == '' or settings['max_size_gb'] is None:
-            settings['max_size_gb'] = float('inf')
-        else:
-            settings['max_size_gb'] = float(settings['max_size_gb'])
+    # Handle infinity values for max_size_gb and max_bitrate_mbps
+    for field in ['max_size_gb', 'max_bitrate_mbps']:
+        if field in settings:
+            if settings[field] == '' or settings[field] is None:
+                settings[field] = float('inf')
+            else:
+                try:
+                    if isinstance(settings[field], str) and settings[field].lower() in ('inf', 'infinity'):
+                        settings[field] = float('inf')
+                    else:
+                        settings[field] = float(settings[field])
+                except (ValueError, TypeError):
+                    settings[field] = float('inf')
+                    logging.warning(f"Invalid {field} value, setting to infinity")
     
     config['Scraping']['versions'][version] = settings
     save_config(config)
@@ -285,9 +382,10 @@ def get_version_settings(version):
     versions = scraping_config.get('versions', {})
     settings = versions.get(version, {})
     
-    # Convert max_size_gb back to empty string if it's infinity
-    if 'max_size_gb' in settings and settings['max_size_gb'] == float('inf'):
-        settings['max_size_gb'] = ''
+    # Convert infinity values back to empty string for both fields
+    for field in ['max_size_gb', 'max_bitrate_mbps']:
+        if field in settings and settings[field] == float('inf'):
+            settings[field] = ''
     
     logging.debug(f"Fetched settings for version '{version}': {settings}")
     

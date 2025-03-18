@@ -1,6 +1,8 @@
 from .core import get_db_connection
 import logging
 import os
+import json
+from typing import List
 
 def search_movies(search_term):
     conn = get_db_connection()
@@ -252,5 +254,60 @@ def get_media_country_code(tmdb_id: str) -> str:
     except Exception as e:
         logging.error(f"Error retrieving country code (TMDB ID: {tmdb_id}): {str(e)}")
         return None
+    finally:
+        conn.close()
+
+def get_episode_details(imdb_id: str, season: int, episode: int) -> dict:
+    """
+    Get episode details including release date by IMDB ID, season, and episode number.
+    Returns None if no episode is found.
+    """
+    conn = get_db_connection()
+    try:
+        cursor = conn.execute('''
+            SELECT * FROM media_items 
+            WHERE imdb_id = ? 
+            AND season_number = ? 
+            AND episode_number = ?
+            AND type = 'episode'
+            LIMIT 1
+        ''', (imdb_id, season, episode))
+        result = cursor.fetchone()
+        return dict(result) if result else None
+    except Exception as e:
+        logging.error(f"Error retrieving episode details (IMDB ID: {imdb_id}, S{season:02d}E{episode:02d}): {str(e)}")
+        return None
+    finally:
+        conn.close()
+
+def get_imdb_aliases(imdb_id: str) -> List[str]:
+    """
+    Get all IMDB aliases for a given IMDB ID from the database.
+    Returns a list of IMDB IDs including aliases.
+    The aliases are stored in JSON string format, e.g. ["tt28251824"]
+    """
+    conn = get_db_connection()
+    try:
+        # First check if the imdb_id exists in the database
+        cursor = conn.execute('''
+            SELECT imdb_aliases FROM media_items 
+            WHERE imdb_id = ? AND imdb_aliases IS NOT NULL
+        ''', (imdb_id,))
+        result = cursor.fetchone()
+        
+        if result and result['imdb_aliases']:
+            try:
+                # Parse the JSON string to get the list of aliases
+                aliases = json.loads(result['imdb_aliases'])
+                if imdb_id not in aliases:
+                    aliases.append(imdb_id)
+                return aliases
+            except json.JSONDecodeError as e:
+                logging.error(f"Error parsing IMDB aliases JSON for {imdb_id}: {str(e)}")
+                return [imdb_id]
+        return [imdb_id]  # Return just the original ID if no aliases found
+    except Exception as e:
+        logging.error(f"Error retrieving IMDB aliases for {imdb_id}: {str(e)}")
+        return [imdb_id]
     finally:
         conn.close()

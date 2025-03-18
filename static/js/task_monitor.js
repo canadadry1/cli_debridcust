@@ -155,9 +155,10 @@ export function initializeTaskMonitor() {
     });
 
     function toggleTaskMonitor() {
-        const isVisible = taskMonitorDropdown.style.display === 'block';
-        taskMonitorDropdown.style.display = isVisible ? 'none' : 'block';
-        currentTaskDisplay.classList.toggle('active', !isVisible);
+        const dropdown = document.getElementById('taskMonitorDropdown');
+        if (dropdown) {
+            dropdown.style.display = dropdown.style.display === 'none' ? 'block' : 'none';
+        }
     }
 
     function toggleTaskMonitorVisibility() {

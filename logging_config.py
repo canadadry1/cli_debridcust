@@ -8,6 +8,7 @@ import threading
 import cProfile
 import pstats
 import io
+from performance_monitor import monitor, start_performance_monitoring
 
 # Global profiler
 global_profiler = cProfile.Profile()
@@ -75,102 +76,82 @@ class DynamicConsoleHandler(logging.StreamHandler):
             self.handleError(record)
 
 def log_system_stats():
-    performance_logger = logging.getLogger('performance_logger')
-    while True:
-        try:
-            process = psutil.Process(os.getpid())
-            cpu_percent = process.cpu_percent(interval=1)
-            memory_info = process.memory_info()
+    """Start the performance monitoring system"""
+    monitor.start_monitoring()
+
+# Create a filter to exclude logs from specific files
+class ExcludeFilter(logging.Filter):
+    def filter(self, record):
+        # Exclude logs from specific files and profiling messages
+        if record.filename == 'rules.py' or record.filename == 'rebulk.py' or record.filename == 'processors.py' or 'profiling' in record.msg.lower():
+            return False
             
-            performance_logger.info(f"CPU Usage: {cpu_percent}% | "
-                                    f"Memory Usage: {memory_info.rss / 1024 / 1024:.2f} MB | "
-                                    f"Virtual Memory: {memory_info.vms / 1024 / 1024:.2f} MB")
+        # Exclude Flask application context error during startup
+        if record.filename == 'settings_routes.py' and record.funcName == 'get_enabled_notifications' and 'Working outside of application context' in str(record.msg):
+            return False
             
-            # Log top CPU-consuming functions
-            global global_profiler
-            s = io.StringIO()
-            ps = pstats.Stats(global_profiler, stream=s).sort_stats('cumulative')
-            ps.print_stats(20)  # Print top 10 time-consuming functions
-            performance_logger.info(f"Top CPU-consuming functions:\n{s.getvalue()}")
-        except Exception as e:
-            performance_logger.error(f"Error logging system stats: {e}")
-        
-        time.sleep(6)  # Log every 60 seconds
+        return True
 
-def setup_logging():
-    # Get log directory from environment variable with fallback
-    log_dir = os.environ.get('USER_LOGS', '/user/logs')
-
-    # Create formatter
-    formatter = logging.Formatter('%(asctime)s - %(filename)s:%(funcName)s:%(lineno)d - %(levelname)s - %(message)s')
-    
-    # Set up root logger
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG)
-    
-    # Set logging level for selector module
-    logging.getLogger('selector').setLevel(logging.WARNING)
-    logging.getLogger('asyncio').setLevel(logging.WARNING)
-
-    # Remove any existing handlers
-    for handler in root_logger.handlers[:]:
-        root_logger.removeHandler(handler)
-    
-    # Console handler
-    console_handler = DynamicConsoleHandler()
-    console_handler.setFormatter(formatter)
-    root_logger.addHandler(console_handler)
-    
-    # Debug file handler
-    debug_handler = logging.handlers.RotatingFileHandler(
-        os.path.join(log_dir, 'debug.log'), maxBytes=50*1024*1024, backupCount=3, encoding='utf-8', errors='replace')
+def setup_debug_logging(log_dir):
+    # Debug file handler with immediate flush
+    class ImmediateRotatingFileHandler(logging.handlers.RotatingFileHandler):
+        def emit(self, record):
+            super().emit(record)
+            self.flush()  # Force immediate flush
+            
+    debug_handler = ImmediateRotatingFileHandler(
+        os.path.join(log_dir, 'debug.log'), 
+        maxBytes=50*1024*1024, 
+        backupCount=5, 
+        encoding='utf-8', 
+        errors='replace'
+    )
     debug_handler.setLevel(logging.DEBUG)
+    
+    # Add filters to exclude unwanted messages
+    debug_handler.addFilter(lambda record: not record.name.startswith(('urllib3', 'requests', 'charset_normalizer')))
+    debug_handler.addFilter(ExcludeFilter())
+    
+    formatter = logging.Formatter('%(asctime)s - %(filename)s:%(funcName)s:%(lineno)d - %(levelname)s - %(message)s')
     debug_handler.setFormatter(formatter)
-    root_logger.addHandler(debug_handler)
+    logging.getLogger().addHandler(debug_handler)
+
+def setup_info_logging(log_dir):
+    # Add console handler for info logs
+    console_handler = DynamicConsoleHandler()
+    console_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
     
-    # Info file handler
-    info_handler = logging.handlers.RotatingFileHandler(
-        os.path.join(log_dir, 'info.log'), maxBytes=50*1024*1024, backupCount=3, encoding='utf-8', errors='replace')
-    info_handler.setLevel(logging.INFO)
-    info_handler.setFormatter(formatter)
-    root_logger.addHandler(info_handler)
+    # Add filters to exclude unwanted messages
+    console_handler.addFilter(lambda record: not record.name.startswith(('urllib3', 'requests', 'charset_normalizer')))
+    console_handler.addFilter(ExcludeFilter())
     
-    # Queue file handler (overwriting on each log)
-    queue_handler = OverwriteFileHandler(os.path.join(log_dir, 'queue.log'), encoding='utf-8')
-    queue_handler.setLevel(logging.INFO)
-    queue_handler.setFormatter(formatter)
-    
-    # Create a separate logger for queue logs
+    # Add handler to root logger
+    logging.getLogger().addHandler(console_handler)
+
+def setup_error_logging(log_dir):
+    # Error file handler
+    error_logger = logging.getLogger('error_logger')
+    error_logger.addHandler(logging.NullHandler())
+    error_logger.propagate = False
+
+def setup_queue_logging(log_dir):
+    # Queue file handler
     queue_logger = logging.getLogger('queue_logger')
-    queue_logger.setLevel(logging.INFO)
-    queue_logger.addHandler(queue_handler)
-    queue_logger.propagate = False  # Prevent queue logs from propagating to root logger
-    
-    # Raise logging level for urllib3 to reduce noise
-    logging.getLogger('urllib3').setLevel(logging.INFO)
+    queue_logger.addHandler(logging.NullHandler())
+    queue_logger.propagate = False
 
-    # Create a filter to exclude logs from specific files
-    class ExcludeFilter(logging.Filter):
-        def filter(self, record):
-            return not (record.filename == 'rules.py' or record.filename == 'rebulk.py' or record.filename == 'processors.py')
-
-    # Apply the filter to all handlers
-    for handler in root_logger.handlers:
-        handler.addFilter(ExcludeFilter())
-
-    # Apply the filter to all existing loggers
-    for name in logging.root.manager.loggerDict:
-        logger = logging.getLogger(name)
-        logger.addFilter(ExcludeFilter())
-
-    # Add the filter to the root logger
-    root_logger.addFilter(ExcludeFilter())
-
-    # Performance file handler
+def setup_performance_logging(log_dir):
+    # Performance file handler with immediate flush
+    performance_formatter = logging.Formatter('%(message)s')
     performance_handler = logging.handlers.RotatingFileHandler(
-        os.path.join(log_dir, 'performance.log'), maxBytes=50*1024*1024, backupCount=0, encoding='utf-8', errors='replace')
+        os.path.join(log_dir, 'performance.log'), 
+        maxBytes=50*1024*1024, 
+        backupCount=0, 
+        encoding='utf-8', 
+        errors='replace'
+    )
     performance_handler.setLevel(logging.INFO)
-    performance_handler.setFormatter(formatter)
+    performance_handler.setFormatter(performance_formatter)
     
     # Create a separate logger for performance logs
     performance_logger = logging.getLogger('performance_logger')
@@ -178,12 +159,29 @@ def setup_logging():
     performance_logger.addHandler(performance_handler)
     performance_logger.propagate = False  # Prevent performance logs from propagating to root logger
 
-    # Start the system stats logging thread
-    stats_thread = threading.Thread(target=log_system_stats, daemon=True)
-    stats_thread.start()
-
-    # Start global profiling
-    start_global_profiling()
+def setup_logging():
+    """Initialize logging configuration"""
+    # Create log directory if it doesn't exist
+    log_dir = os.environ.get('USER_LOGS', '/user/logs')
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir)
+    
+    # Configure root logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.DEBUG)  # Set to DEBUG to see all debug messages
+    
+    # Clear any existing handlers
+    root_logger.handlers.clear()
+    
+    # Configure handlers
+    setup_debug_logging(log_dir)
+    setup_info_logging(log_dir)
+    setup_error_logging(log_dir)
+    setup_queue_logging(log_dir)
+    setup_performance_logging(log_dir)
+    
+    # Start performance monitoring after logging is set up
+    start_performance_monitoring()
 
 if __name__ == "__main__":
     setup_logging()

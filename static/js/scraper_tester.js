@@ -381,51 +381,82 @@ document.addEventListener('DOMContentLoaded', function() {
         originalSettingsContainer.innerHTML = `<h3>Original ${settings.display_name || version} Settings</h3>`;
         modifiedSettingsContainer.innerHTML = `<h3>Modified ${settings.display_name || version} Settings</h3>`;
     
-        for (const [key, value] of Object.entries(settings)) {
-            if (key !== 'display_name') {
-                const formGroup = document.createElement('div');
-                formGroup.className = 'settings-form-group';
+        // Define the order of settings
+        const settingsOrder = [
+            'max_resolution',
+            'resolution_wanted',
+            'min_size_gb',
+            'max_size_gb',
+            'min_bitrate_mbps',
+            'max_bitrate_mbps',
+            'resolution_weight',
+            'size_weight',
+            'bitrate_weight',
+            'similarity_weight',
+            'similarity_threshold',
+            'similarity_threshold_anime',
+            'enable_hdr',
+            'hdr_weight',
+            'filter_in',
+            'filter_out',
+            'preferred_filter_in',
+            'preferred_filter_out'
+        ];
     
-                let labelText = key.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
-                
-                console.log(`Setting ${key} to:`, value);
+        // Sort the settings according to the defined order
+        const sortedSettings = Object.entries(settings)
+            .filter(([key]) => key !== 'display_name')
+            .sort(([a], [b]) => {
+                const aIndex = settingsOrder.indexOf(a);
+                const bIndex = settingsOrder.indexOf(b);
+                if (aIndex === -1) return 1;  // Put unknown settings at the end
+                if (bIndex === -1) return -1;
+                return aIndex - bIndex;
+            });
     
-                // Rename the fields
-                if (key === 'max_resolution') {
-                    labelText = 'Resolution Wanted';
-                } else if (key === 'resolution_wanted') {
-                    labelText = 'Resolution Symbol';
-                }
+        for (const [key, value] of sortedSettings) {
+            const formGroup = document.createElement('div');
+            formGroup.className = 'settings-form-group';
     
-                const label = document.createElement('label');
-                label.className = 'settings-title';
-                label.setAttribute('for', `scraping-${version}-${key}`);
-                label.textContent = `${labelText}:`;
+            let labelText = key.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+            
+            console.log(`Setting ${key} to:`, value);
     
-                // Create input elements for both original and modified settings
-                let [originalInput, modifiedInput] = createInputElements(key, value);
-    
-                // Set up original input
-                originalInput.id = `original-scraping-${version}-${key}`;
-                originalInput.name = `Original.Scraping.versions.${version}.${key}`;
-                originalInput.className = 'settings-input original-input';
-                originalInput.disabled = true;
-    
-                // Set up modified input
-                modifiedInput.id = `scraping-${version}-${key}`;
-                modifiedInput.name = `Scraping.versions.${version}.${key}`;
-                modifiedInput.className = 'settings-input';
-    
-                const originalGroup = formGroup.cloneNode(true);
-                originalGroup.appendChild(label.cloneNode(true));
-                originalGroup.appendChild(originalInput);
-                originalSettingsContainer.appendChild(originalGroup);
-    
-                const modifiedGroup = formGroup.cloneNode(true);
-                modifiedGroup.appendChild(label.cloneNode(true));
-                modifiedGroup.appendChild(modifiedInput);
-                modifiedSettingsContainer.appendChild(modifiedGroup);
+            // Rename the fields
+            if (key === 'max_resolution') {
+                labelText = 'Resolution Wanted';
+            } else if (key === 'resolution_wanted') {
+                labelText = 'Resolution Symbol';
             }
+    
+            const label = document.createElement('label');
+            label.className = 'settings-title';
+            label.setAttribute('for', `scraping-${version}-${key}`);
+            label.textContent = `${labelText}:`;
+    
+            // Create input elements for both original and modified settings
+            let [originalInput, modifiedInput] = createInputElements(key, value);
+    
+            // Set up original input
+            originalInput.id = `original-scraping-${version}-${key}`;
+            originalInput.name = `Original.Scraping.versions.${version}.${key}`;
+            originalInput.className = 'settings-input original-input';
+            originalInput.disabled = true;
+    
+            // Set up modified input
+            modifiedInput.id = `scraping-${version}-${key}`;
+            modifiedInput.name = `Scraping.versions.${version}.${key}`;
+            modifiedInput.className = 'settings-input';
+    
+            const originalGroup = formGroup.cloneNode(true);
+            originalGroup.appendChild(label.cloneNode(true));
+            originalGroup.appendChild(originalInput);
+            originalSettingsContainer.appendChild(originalGroup);
+    
+            const modifiedGroup = formGroup.cloneNode(true);
+            modifiedGroup.appendChild(label.cloneNode(true));
+            modifiedGroup.appendChild(modifiedInput);
+            modifiedSettingsContainer.appendChild(modifiedGroup);
         }
     
         // Add the save button
@@ -445,7 +476,7 @@ document.addEventListener('DOMContentLoaded', function() {
     function createInputElements(key, value) {
         let originalInput, modifiedInput;
     
-        if (key === 'enable_hdr') {
+        if (typeof value === 'boolean') {
             originalInput = document.createElement('input');
             originalInput.type = 'checkbox';
             originalInput.checked = value;
@@ -461,7 +492,6 @@ document.addEventListener('DOMContentLoaded', function() {
                 originalInput.appendChild(optionElement);
                 modifiedInput.appendChild(optionElement.cloneNode(true));
             });
-            // Ensure the correct option is selected for both inputs
             originalInput.value = value;
             modifiedInput.value = value;
         } else if (key === 'resolution_wanted') {
@@ -475,7 +505,6 @@ document.addEventListener('DOMContentLoaded', function() {
                 originalInput.appendChild(optionElement);
                 modifiedInput.appendChild(optionElement.cloneNode(true));
             });
-            // Ensure the correct option is selected for both inputs
             originalInput.value = value;
             modifiedInput.value = value;
         } else if (['filter_in', 'filter_out'].includes(key)) {
@@ -484,6 +513,34 @@ document.addEventListener('DOMContentLoaded', function() {
         } else if (['preferred_filter_in', 'preferred_filter_out'].includes(key)) {
             originalInput = createPreferredFilterList(key, value, true);
             modifiedInput = createPreferredFilterList(key, value, false);
+        } else if (key === 'max_size_gb' || key === 'min_size_gb' || key === 'max_bitrate_mbps' || key === 'min_bitrate_mbps') {
+            // Size and bitrate fields
+            originalInput = document.createElement('input');
+            originalInput.type = 'number';
+            originalInput.step = '0.01';  // Allow decimal values
+            originalInput.min = '0';      // Don't allow negative values
+            originalInput.placeholder = key.startsWith('max_') ? 'No limit' : '0';
+            originalInput.value = (value === '' || value === null || value === Infinity) ? '' : value;
+            modifiedInput = originalInput.cloneNode(true);
+        } else if (key.endsWith('_weight')) {
+            // Weight fields
+            originalInput = document.createElement('input');
+            originalInput.type = 'number';
+            originalInput.step = '1';     // Integer values only
+            originalInput.min = '0';      // Don't allow negative values
+            originalInput.placeholder = '0';
+            originalInput.value = value;
+            modifiedInput = originalInput.cloneNode(true);
+        } else if (key.includes('similarity_threshold')) {
+            // Similarity threshold fields
+            originalInput = document.createElement('input');
+            originalInput.type = 'number';
+            originalInput.step = '0.01';  // Allow decimal values
+            originalInput.min = '0';      // Min value 0
+            originalInput.max = '1';      // Max value 1
+            originalInput.placeholder = '0.8';
+            originalInput.value = value;
+            modifiedInput = originalInput.cloneNode(true);
         } else {
             originalInput = document.createElement('input');
             originalInput.type = typeof value === 'number' ? 'number' : 'text';
@@ -600,6 +657,37 @@ document.addEventListener('DOMContentLoaded', function() {
         return itemContainer;
     }
 
+    function getModifiedVersionSettings() {
+        const settings = {};
+        document.querySelectorAll('#modifiedSettings .settings-input').forEach(input => {
+            const settingKey = input.id.split('-')[2];
+            if (input.type === 'checkbox') {
+                settings[settingKey] = input.checked;
+            } else if (input.type === 'select-one') {
+                settings[settingKey] = input.value;
+            } else if (settingKey === 'filter_in' || settingKey === 'filter_out') {
+                settings[settingKey] = Array.from(input.querySelectorAll('.filter-input')).map(item => item.value).filter(Boolean);
+            } else if (settingKey === 'preferred_filter_in' || settingKey === 'preferred_filter_out') {
+                settings[settingKey] = Array.from(input.querySelectorAll('.preferred-filter-item')).map(item => {
+                    const term = item.querySelector('.filter-input').value;
+                    const weight = parseInt(item.querySelector('.filter-weight').value);
+                    return term && !isNaN(weight) ? [term, weight] : null;
+                }).filter(Boolean);
+            } else if (settingKey === 'max_size_gb' || settingKey === 'min_size_gb' || settingKey === 'max_bitrate_mbps' || settingKey === 'min_bitrate_mbps') {
+                // Handle size and bitrate fields
+                if (input.value === '' || input.value === null) {
+                    settings[settingKey] = settingKey.startsWith('max_') ? Infinity : 0;
+                } else {
+                    const numValue = parseFloat(input.value);
+                    settings[settingKey] = isNaN(numValue) ? (settingKey.startsWith('max_') ? Infinity : 0) : numValue;
+                }
+            } else {
+                settings[settingKey] = input.value;
+            }
+        });
+        return settings;
+    }
+
     function runScrape() {
         Loading.show();
         const version = document.getElementById('version-select').value;
@@ -614,7 +702,8 @@ document.addEventListener('DOMContentLoaded', function() {
             year: currentItem.year,
             movie_or_episode: isTV ? 'episode' : 'movie',
             version: version,
-            modifiedSettings: modifiedSettings
+            modifiedSettings: modifiedSettings,
+            skip_cache_check: true  // Always skip cache check in scraper tester
         };
     
         // Add TV show specific information
@@ -666,29 +755,6 @@ document.addEventListener('DOMContentLoaded', function() {
         });
     }
    
-    function getModifiedVersionSettings() {
-        const settings = {};
-        document.querySelectorAll('#modifiedSettings .settings-input').forEach(input => {
-            const settingKey = input.id.split('-')[2];
-            if (input.type === 'checkbox') {
-                settings[settingKey] = input.checked;
-            } else if (input.type === 'select-one') {
-                settings[settingKey] = input.value;
-            } else if (settingKey === 'filter_in' || settingKey === 'filter_out') {
-                settings[settingKey] = Array.from(input.querySelectorAll('.filter-input')).map(item => item.value).filter(Boolean);
-            } else if (settingKey === 'preferred_filter_in' || settingKey === 'preferred_filter_out') {
-                settings[settingKey] = Array.from(input.querySelectorAll('.preferred-filter-item')).map(item => {
-                    const term = item.querySelector('.filter-input').value;
-                    const weight = parseInt(item.querySelector('.filter-weight').value);
-                    return term && !isNaN(weight) ? [term, weight] : null;
-                }).filter(Boolean);
-            } else {
-                settings[settingKey] = input.value;
-            }
-        });
-        return settings;
-    }
-
     function displayScrapeResults(data) {
         originalResults.innerHTML = '<h3>Original Results</h3>';
         adjustedResults.innerHTML = '<h3>Adjusted Results</h3>';
@@ -710,8 +776,10 @@ document.addEventListener('DOMContentLoaded', function() {
         // Add click event listeners to result items
         document.querySelectorAll('.result-item').forEach(item => {
             item.addEventListener('click', function() {
-                const resultIndex = Array.from(this.parentNode.children).indexOf(this);
-                const result = this.parentNode.id === 'original-results' 
+                // Get all result items in the same table and find this item's index among them
+                const resultItems = this.parentNode.querySelectorAll('.result-item');
+                const resultIndex = Array.from(resultItems).indexOf(this);
+                const result = this.closest('table').parentNode.id === 'original-results' 
                     ? data.originalResults[resultIndex] 
                     : data.adjustedResults[resultIndex];
                 displayScoreBreakdown(result);
@@ -871,4 +939,3 @@ document.addEventListener('DOMContentLoaded', function() {
 document.getElementById('modifiedSettings').addEventListener('input', updateSaveButtonState);
 document.getElementById('modifiedSettings').addEventListener('change', updateSaveButtonState);
 });
-

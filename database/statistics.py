@@ -434,7 +434,7 @@ async def get_recently_upgraded_items(upgraded_limit=5):
     try:
         cursor = conn.cursor()
         
-        # Optimized query for upgrades
+        # Optimized query for upgrades - sort by collected_at for better differentiation
         upgraded_query = """
         WITH LatestUpgrades AS (
             SELECT 
@@ -446,7 +446,10 @@ async def get_recently_upgraded_items(upgraded_limit=5):
                 version,
                 filled_by_title,
                 filled_by_file,
+                upgrading_from,
                 last_updated,
+                collected_at,
+                original_collected_at,
                 season_number,
                 episode_number,
                 ROW_NUMBER() OVER (
@@ -455,16 +458,16 @@ async def get_recently_upgraded_items(upgraded_limit=5):
                             WHEN type = 'movie' THEN title || year
                             ELSE title || season_number || episode_number
                         END 
-                    ORDER BY last_updated DESC
+                    ORDER BY collected_at DESC
                 ) as rn
             FROM media_items
             WHERE upgraded = 1
-            AND last_updated IS NOT NULL
+            AND collected_at IS NOT NULL
         )
         SELECT *
         FROM LatestUpgrades
         WHERE rn = 1
-        ORDER BY last_updated DESC
+        ORDER BY collected_at DESC
         LIMIT ?
         """
         
@@ -479,6 +482,11 @@ async def get_recently_upgraded_items(upgraded_limit=5):
                 item = dict(row)
                 media_type = 'movie' if item['type'] == 'movie' else 'tv'
                 
+                # Make sure collected_at is available for sorting consistency
+                if item['collected_at'] is None:
+                    logging.warning(f"Upgraded item missing collected_at: {item['title']}")
+                    continue
+                
                 media_item = {
                     'title': item['title'],
                     'year': item['year'],
@@ -486,7 +494,10 @@ async def get_recently_upgraded_items(upgraded_limit=5):
                     'version': item['version'],
                     'filled_by_file': item['filled_by_file'],
                     'filled_by_title': item['filled_by_title'] if item['filled_by_title'] else item['filled_by_file'],
+                    'upgrading_from': item['upgrading_from'],
                     'last_updated': item['last_updated'],
+                    'collected_at': item['collected_at'],
+                    'original_collected_at': item['original_collected_at'],
                     'tmdb_id': item['tmdb_id']
                 }
                 

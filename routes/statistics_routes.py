@@ -15,11 +15,10 @@ from database import get_recently_added_items, get_poster_url, get_collected_cou
 from debrid import get_debrid_provider, TooManyDownloadsError, ProviderUnavailableError
 from metadata.metadata import get_show_airtime_by_imdb_id, _get_local_timezone
 from database.statistics import get_cached_download_stats
+from .program_operation_routes import program_is_running, program_is_initializing
 import json
 import math
 from functools import wraps
-from zoneinfo import ZoneInfo
-from tzlocal import get_localzone
 
 def cache_for_seconds(seconds):
     """Cache the result of a function for the specified number of seconds."""
@@ -101,7 +100,7 @@ def get_upcoming_releases():
     
     # First get all upcoming releases
     query = """
-    SELECT DISTINCT m.title, m.release_date, m.tmdb_id
+    SELECT DISTINCT m.title, m.release_date, m.tmdb_id, m.imdb_id
     FROM media_items m
     WHERE m.type = 'movie' AND m.release_date BETWEEN ? AND ?
     ORDER BY m.release_date ASC
@@ -123,16 +122,25 @@ def get_upcoming_releases():
     
     # Group by release date, excluding existing movies
     grouped_results = {}
-    for title, release_date, tmdb_id in results:
+    for title, release_date, tmdb_id, imdb_id in results:
         if tmdb_id not in existing_tmdb_ids:  # Only include if not in our collection
             if release_date not in grouped_results:
-                grouped_results[release_date] = set()
-            grouped_results[release_date].add(title)
+                grouped_results[release_date] = []
+            grouped_results[release_date].append({
+                'title': title,
+                'tmdb_id': tmdb_id,
+                'imdb_id': imdb_id
+            })
     
     # Format the results
     formatted_results = [
-        {'titles': list(titles), 'release_date': date}
-        for date, titles in grouped_results.items()
+        {
+            'titles': [item['title'] for item in items],
+            'tmdb_ids': [item['tmdb_id'] for item in items if item['tmdb_id']],
+            'imdb_ids': [item['imdb_id'] for item in items if item['imdb_id']],
+            'release_date': date
+        }
+        for date, items in grouped_results.items()
     ]
     
     return formatted_results
@@ -141,29 +149,42 @@ def get_recently_aired_and_airing_soon():
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    # Get timezone from system or override
-    timezone = get_setting('Debug', 'timezone_override', '')
-    if timezone: 
-        local_tz = ZoneInfo(timezone)
-    else:
-        local_tz = get_localzone()
+    # Get timezone using our robust function
+    local_tz = _get_local_timezone()
     now = datetime.now(local_tz)
     two_days_ago = now - timedelta(days=2)
     
     query = """
-    WITH RankedEpisodes AS (
-        SELECT 
+    WITH CollectedEpisodes AS (
+        -- First get all episodes that are collected/upgrading
+        SELECT DISTINCT 
             title,
             season_number,
-            episode_number,
-            release_date,
-            airtime,
-            imdb_id,
-            ROW_NUMBER() OVER (PARTITION BY title, season_number, episode_number ORDER BY release_date DESC, airtime DESC) as rn
+            episode_number
         FROM media_items
-        WHERE type = 'episode' 
-        AND release_date >= ? 
-        AND release_date <= ?
+        WHERE type = 'episode'
+        AND state IN ('Collected', 'Upgrading')
+    ),
+    RankedEpisodes AS (
+        -- Then get our main episode data with collection status
+        SELECT 
+            m.title,
+            m.season_number,
+            m.episode_number,
+            m.release_date,
+            m.airtime,
+            m.imdb_id,
+            m.tmdb_id,
+            CASE WHEN c.title IS NOT NULL THEN 1 ELSE 0 END as is_collected,
+            ROW_NUMBER() OVER (PARTITION BY m.title, m.season_number, m.episode_number ORDER BY m.release_date DESC, m.airtime DESC) as rn
+        FROM media_items m
+        LEFT JOIN CollectedEpisodes c ON 
+            c.title = m.title 
+            AND c.season_number = m.season_number 
+            AND c.episode_number = m.episode_number
+        WHERE m.type = 'episode' 
+        AND m.release_date >= ? 
+        AND m.release_date <= ?
     )
     SELECT DISTINCT 
         title,
@@ -171,7 +192,9 @@ def get_recently_aired_and_airing_soon():
         episode_number,
         release_date,
         airtime,
-        imdb_id
+        imdb_id,
+        tmdb_id,
+        is_collected
     FROM RankedEpisodes
     WHERE rn = 1
     ORDER BY release_date, airtime, title, season_number, episode_number
@@ -189,7 +212,7 @@ def get_recently_aired_and_airing_soon():
     shows = {}
     
     for result in results:
-        title, season, episode, release_date, airtime, imdb_id = result
+        title, season, episode, release_date, airtime, imdb_id, tmdb_id, is_collected = result
         try:
             release_date = datetime.fromisoformat(release_date)
             
@@ -202,14 +225,9 @@ def get_recently_aired_and_airing_soon():
                 logging.warning(f"Invalid airtime format for {title}: {airtime}. Using default.")
                 airtime = datetime.strptime("19:00", '%H:%M').time()
             
-            # Create datetime in system timezone first
-            system_tz = get_localzone()
+            # Create datetime in local timezone
             air_datetime = datetime.combine(release_date.date(), airtime)
-            air_datetime = system_tz.localize(air_datetime) if hasattr(system_tz, 'localize') else air_datetime.replace(tzinfo=system_tz)
-            
-            # Convert to display timezone if different
-            if local_tz != system_tz:
-                air_datetime = air_datetime.astimezone(local_tz)
+            air_datetime = air_datetime.replace(tzinfo=local_tz)
             
             # Create a key for grouping
             show_key = f"{title}_{season}_{release_date.date()}"
@@ -220,7 +238,10 @@ def get_recently_aired_and_airing_soon():
                     'season': season,
                     'episodes': set(),
                     'air_datetime': air_datetime,
-                    'release_date': release_date.date()
+                    'release_date': release_date.date(),
+                    'is_collected': bool(is_collected),
+                    'imdb_id': imdb_id,
+                    'tmdb_id': tmdb_id
                 }
             
             shows[show_key]['episodes'].add(episode)
@@ -248,6 +269,8 @@ def get_recently_aired_and_airing_soon():
         # Format episode ranges
         episode_parts = []
         for start, end in ranges:
+            if start is None or end is None:
+                continue
             if start == end:
                 episode_parts.append(f"E{start:02d}")
             else:
@@ -258,7 +281,12 @@ def get_recently_aired_and_airing_soon():
             'title': f"{show['title']} S{show['season']:02d}{episode_range}",
             'air_datetime': show['air_datetime'],
             'sort_key': show['air_datetime'].isoformat(),
-            'formatted_datetime': format_datetime_preference(show['air_datetime'], session.get('use_24hour_format', False))
+            'formatted_datetime': format_datetime_preference(show['air_datetime'], session.get('use_24hour_format', False)),
+            'is_collected': show['is_collected'],
+            'imdb_id': show['imdb_id'],
+            'tmdb_id': show['tmdb_id'],
+            'season_number': show['season'],
+            'episode_number': episodes[0]  # Use first episode number for single episodes or ranges
         }
         
         if show['air_datetime'] <= now:
@@ -309,12 +337,8 @@ def root():
     # Get all statistics data
     stats = {}
     
-    # Get timezone from system or override
-    timezone = get_setting('Debug', 'timezone_override', '')
-    if timezone: 
-        local_tz = ZoneInfo(timezone)
-    else:
-        local_tz = get_localzone()
+    # Get timezone using our robust function
+    local_tz = _get_local_timezone()
     stats['timezone'] = str(local_tz)
     stats['uptime'] = int(time.time() - app_start_time)
     
@@ -395,6 +419,7 @@ def root():
                     movie['collected_at'], 
                     use_24hour_format
                 )
+                movie['formatted_collected_at'] = movie['formatted_date']
                 recently_added['movies'].append(movie)
         
         # Process shows
@@ -406,18 +431,29 @@ def root():
                 )
                 recently_added['shows'].append(show)
         
-        # Get recently upgraded items with logging
-        #logging.info("Fetching recently upgraded items...")
-        recently_upgraded = loop.run_until_complete(get_recently_upgraded_items())
-        #logging.info(f"Raw recently upgraded items: {recently_upgraded}")
-        
-        # Format dates for upgraded items
-        for item in recently_upgraded:
-            item['formatted_date'] = format_datetime_preference(
-                item['last_updated'], 
-                use_24hour_format
-            )
-            #logging.info(f"Formatted upgraded item: {item}")
+        # Get recently upgraded items
+        upgrade_enabled = get_setting('Scraping', 'enable_upgrading', False)
+        if upgrade_enabled:
+            recently_upgraded = loop.run_until_complete(get_recently_upgraded_items())
+            for item in recently_upgraded:
+                # Format the upgrade date using collected_at for better differentiation
+                item['formatted_date'] = format_datetime_preference(
+                    item['collected_at'], 
+                    use_24hour_format
+                )
+                
+                # For original_collected_at, use the existing value if available
+                if item.get('original_collected_at'):
+                    item['original_collected_at'] = format_datetime_preference(
+                        item['original_collected_at'],
+                        use_24hour_format
+                    )
+                else:
+                    # If original_collected_at is not available, we don't need to create a fake one
+                    # as the UI only needs to show when the upgrade happened
+                    item['original_collected_at'] = 'Unknown'
+        else:
+            recently_upgraded = []
     
     finally:
         loop.close()
@@ -523,10 +559,13 @@ def set_time_preference():
                             collected_at = None
                     
                     if collected_at:
+                        item['formatted_date'] = format_datetime_preference(collected_at, use_24hour_format)
                         item['formatted_collected_at'] = format_datetime_preference(collected_at, use_24hour_format)
                     else:
+                        item['formatted_date'] = 'Unknown'
                         item['formatted_collected_at'] = 'Unknown'
                 else:
+                    item['formatted_date'] = 'Unknown'
                     item['formatted_collected_at'] = 'Unknown'
             
             # Get recently aired and upcoming shows
@@ -542,13 +581,27 @@ def set_time_preference():
             for release in upcoming_releases:
                 release['formatted_date'] = format_date(release.get('release_date'))
             
-            # Get recently upgraded items if enabled
-            upgrade_enabled = get_setting('Scraping', 'enable_upgrading', 'False')
+            # Get recently upgraded items
+            upgrade_enabled = get_setting('Scraping', 'enable_upgrading', False)
             if upgrade_enabled:
                 recently_upgraded = loop.run_until_complete(get_recently_upgraded_items(upgraded_limit=5))
                 for item in recently_upgraded:
-                    if 'last_updated' in item:
-                        item['formatted_date'] = format_datetime_preference(item['last_updated'], use_24hour_format)
+                    # Format the upgrade date using collected_at for better differentiation
+                    item['formatted_date'] = format_datetime_preference(
+                        item['collected_at'], 
+                        use_24hour_format
+                    )
+                    
+                    # For original_collected_at, use the existing value if available
+                    if item.get('original_collected_at'):
+                        item['original_collected_at'] = format_datetime_preference(
+                            item['original_collected_at'],
+                            use_24hour_format
+                        )
+                    else:
+                        # If original_collected_at is not available, we don't need to create a fake one
+                        # as the UI only needs to show when the upgrade happened
+                        item['original_collected_at'] = 'Unknown'
             else:
                 recently_upgraded = []
                 
@@ -753,47 +806,54 @@ def format_datetime_preference(date_input, use_24hour_format):
     if not date_input:
         return ''
     try:
-        # Get timezone from system or override
-        timezone = get_setting('Debug', 'timezone_override', '')
-        if timezone: 
-            local_tz = ZoneInfo(timezone)
-        else:
-            local_tz = get_localzone()
+        # Get timezone using our robust function
+        local_tz = _get_local_timezone()
+        
+        # Convert string to datetime if necessary
         if isinstance(date_input, str):
-            date = datetime.fromisoformat(date_input.rstrip('Z'))  # Remove 'Z' if present
-        elif isinstance(date_input, datetime):
-            date = date_input
-        else:
-            return str(date_input)
+            try:
+                # Try parsing with microseconds
+                date_input = datetime.strptime(date_input, '%Y-%m-%d %H:%M:%S.%f')
+            except ValueError:
+                try:
+                    # Try parsing without microseconds
+                    date_input = datetime.strptime(date_input, '%Y-%m-%d %H:%M:%S')
+                except ValueError:
+                    try:
+                        # Try parsing ISO format
+                        date_input = datetime.fromisoformat(date_input.rstrip('Z'))
+                    except ValueError:
+                        return str(date_input)  # Return original string if all parsing fails
         
         # Ensure the datetime is timezone-aware
-        if date.tzinfo is None:
-            date = local_tz.localize(date) if hasattr(local_tz, 'localize') else date.replace(tzinfo=local_tz)
+        if date_input.tzinfo is None:
+            date_input = local_tz.localize(date_input) if hasattr(local_tz, 'localize') else date_input.replace(tzinfo=local_tz)
         
         now = datetime.now(local_tz)
         today = now.date()
         yesterday = today - timedelta(days=1)
         tomorrow = today + timedelta(days=1)
 
-        if date.date() == today:
+        if date_input.date() == today:
             day_str = "Today"
-        elif date.date() == yesterday:
+        elif date_input.date() == yesterday:
             day_str = "Yesterday"
-        elif date.date() == tomorrow:
+        elif date_input.date() == tomorrow:
             day_str = "Tomorrow"
         else:
-            day_str = date.strftime("%a, %d %b %Y")
+            day_str = date_input.strftime("%a, %d %b %Y")
 
         time_format = "%H:%M" if use_24hour_format else "%I:%M %p"
-        formatted_time = date.strftime(time_format)
+        formatted_time = date_input.strftime(time_format)
         
         # Remove leading zero from hour in 12-hour format
         if not use_24hour_format:
             formatted_time = formatted_time.lstrip("0")
         
         return f"{day_str} {formatted_time}"
-    except ValueError:
-        return str(date_input)  # Return original string if parsing fails
+    except Exception as e:
+        logging.error(f"Error formatting datetime: {str(e)}")
+        return str(date_input)  # Return original string if any error occurs
 
 def format_bytes(bytes_value, decimals=2):
     """Format bytes to human readable string"""
@@ -824,3 +884,206 @@ def usage_stats():
                 'error': 'failed'
             }
         })
+
+@statistics_bp.route('/api/index')
+@user_required
+def index_api():
+    """API endpoint that returns the same data as the index route but in JSON format"""
+    stats = {}
+    
+    # Get timezone using our robust function
+    local_tz = _get_local_timezone()
+    stats['timezone'] = str(local_tz)
+    stats['uptime'] = int(time.time() - app_start_time)
+    
+    # Get program status
+    stats['program_status'] = {
+        'running': program_is_running(),
+        'initializing': program_is_initializing()
+    }
+    
+    # Get collection counts
+    counts = get_collected_counts()
+    stats['total_movies'] = counts['total_movies']
+    stats['total_shows'] = counts['total_shows']
+    stats['total_episodes'] = counts['total_episodes']
+    
+    # Get active downloads and usage stats
+    active_downloads = get_cached_active_downloads()
+    usage_stats = get_cached_user_traffic()
+    stats['active_downloads_data'] = active_downloads
+    stats['usage_stats_data'] = usage_stats
+    
+    # Get recently aired and upcoming shows
+    recently_aired, airing_soon = get_recently_aired_and_airing_soon()
+    
+    # Get upcoming releases
+    upcoming_releases = get_upcoming_releases()
+    for release in upcoming_releases:
+        release['formatted_date'] = format_date(release['release_date'])
+    
+    # Get recently added and upgraded items
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    try:
+        # Get recently added items
+        recently_added_data = loop.run_until_complete(get_recently_added_items())
+        recently_added = {
+            'movies': [],
+            'shows': []
+        }
+        
+        use_24hour_format = get_setting('UI Settings', 'use_24hour_format', True)
+        
+        # Process movies
+        if 'movies' in recently_added_data:
+            for movie in recently_added_data['movies']:
+                movie['formatted_date'] = format_datetime_preference(
+                    movie['collected_at'],
+                    use_24hour_format
+                )
+                recently_added['movies'].append(movie)
+        
+        # Process shows
+        if 'shows' in recently_added_data:
+            for show in recently_added_data['shows']:
+                show['formatted_date'] = format_datetime_preference(
+                    show['collected_at'],
+                    use_24hour_format
+                )
+                recently_added['shows'].append(show)
+        
+        # Get recently upgraded items
+        upgrade_enabled = get_setting('Scraping', 'enable_upgrading', False)
+        if upgrade_enabled:
+            recently_upgraded = loop.run_until_complete(get_recently_upgraded_items())
+            for item in recently_upgraded:
+                # Format the upgrade date using collected_at for better differentiation
+                item['formatted_date'] = format_datetime_preference(
+                    item['collected_at'], 
+                    use_24hour_format
+                )
+                
+                # For original_collected_at, use the existing value if available
+                if item.get('original_collected_at'):
+                    item['original_collected_at'] = format_datetime_preference(
+                        item['original_collected_at'],
+                        use_24hour_format
+                    )
+                else:
+                    # If original_collected_at is not available, we don't need to create a fake one
+                    # as the UI only needs to show when the upgrade happened
+                    item['original_collected_at'] = 'Unknown'
+        else:
+            recently_upgraded = []
+    
+    finally:
+        loop.close()
+    
+    # Check if TMDB API key is set
+    tmdb_api_key = get_setting('TMDB', 'api_key', '')
+    stats['tmdb_api_key_set'] = bool(tmdb_api_key)
+    
+    # Format dates for recently aired and airing soon
+    for item in recently_aired:
+        item['formatted_datetime'] = format_datetime_preference(
+            item['air_datetime'],
+            use_24hour_format
+        )
+    
+    for item in airing_soon:
+        item['formatted_datetime'] = format_datetime_preference(
+            item['air_datetime'],
+            use_24hour_format
+        )
+    
+    return jsonify({
+        'stats': stats,
+        'recently_aired': recently_aired,
+        'airing_soon': airing_soon,
+        'upcoming_releases': upcoming_releases,
+        'recently_added': recently_added,
+        'recently_upgraded': recently_upgraded,
+        'use_24hour_format': use_24hour_format
+    })
+
+@statistics_bp.route('/move_to_wanted', methods=['POST'])
+@user_required
+def move_to_wanted():
+    """Move an item back to Wanted state and disable not wanted checks"""
+    try:
+        data = request.json
+        imdb_id = data.get('imdb_id')
+        tmdb_id = data.get('tmdb_id')
+        season_number = data.get('season_number')
+        episode_number = data.get('episode_number')
+        
+        if not (imdb_id or tmdb_id):
+            return jsonify({'success': False, 'error': 'IMDb ID or TMDB ID is required'}), 400
+            
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Build query based on item type
+        if season_number is not None and episode_number is not None:
+            # Episode
+            query = """
+                UPDATE media_items 
+                SET state = 'Wanted',
+                    filled_by_file = NULL,
+                    filled_by_title = NULL,
+                    filled_by_magnet = NULL,
+                    filled_by_torrent_id = NULL,
+                    collected_at = NULL,
+                    last_updated = ?,
+                    disable_not_wanted_check = TRUE,
+                    location_on_disk = NULL,
+                    original_path_for_symlink = NULL,
+                    original_scraped_torrent_title = NULL,
+                    upgrading_from = NULL,
+                    version = TRIM(version, '*'),
+                    upgrading = NULL
+                WHERE (imdb_id = ? OR tmdb_id = ?)
+                AND season_number = ? 
+                AND episode_number = ?
+                AND state IN ('Collected', 'Upgrading')
+            """
+            params = (datetime.now(), imdb_id, tmdb_id, season_number, episode_number)
+        else:
+            # Movie
+            query = """
+                UPDATE media_items 
+                SET state = 'Wanted',
+                    filled_by_file = NULL,
+                    filled_by_title = NULL,
+                    filled_by_magnet = NULL,
+                    filled_by_torrent_id = NULL,
+                    collected_at = NULL,
+                    last_updated = ?,
+                    disable_not_wanted_check = TRUE,
+                    location_on_disk = NULL,
+                    original_path_for_symlink = NULL,
+                    original_scraped_torrent_title = NULL,
+                    upgrading_from = NULL,
+                    version = TRIM(version, '*'),
+                    upgrading = NULL
+                WHERE (imdb_id = ? OR tmdb_id = ?)
+                AND type = 'movie'
+                AND state IN ('Collected', 'Upgrading')
+            """
+            params = (datetime.now(), imdb_id, tmdb_id)
+            
+        cursor.execute(query, params)
+        conn.commit()
+        
+        if cursor.rowcount > 0:
+            return jsonify({'success': True}), 200
+        else:
+            return jsonify({'success': False, 'error': 'No matching items found or items not in Collected/Upgrading state'}), 404
+            
+    except Exception as e:
+        logging.error(f"Error moving item to Wanted state: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        conn.close()

@@ -9,6 +9,7 @@ import platform
 import psutil
 import webbrowser
 import socket
+import sqlite3
 from datetime import datetime
 
 # Import Windows-specific modules only on Windows
@@ -25,6 +26,13 @@ from settings import set_setting
 from settings import get_setting
 from logging_config import stop_global_profiling, start_global_profiling
 import babelfish
+from content_checkers.plex_watchlist import validate_plex_tokens
+from notifications import (
+    setup_crash_handler, 
+    register_shutdown_handler, 
+    register_startup_handler,
+    send_program_stop_notification
+)
 
 if sys.platform.startswith('win'):
     app_name = "cli_debrid"  # Replace with your app's name
@@ -79,7 +87,7 @@ def setup_logging():
     os.makedirs(log_dir, exist_ok=True)
 
     # Ensure log files exist
-    for log_file in ['debug.log', 'info.log', 'queue.log']:
+    for log_file in ['debug.log']:
         log_path = os.path.join(log_dir, log_file)
         if not os.path.exists(log_path):
             open(log_path, 'a').close()
@@ -170,6 +178,7 @@ def get_version():
         return "0.0.0"
 
 def signal_handler(signum, frame):
+    """Handle termination signals gracefully."""
     stop_program(from_signal=True)
     # Exit directly when handling SIGINT
     if signum == signal.SIGINT:
@@ -311,131 +320,12 @@ def setup_tray_icon():
         except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
             return False
 
-    def install_ffmpeg():
-        try:
-            if platform.system() != 'Windows':
-                logging.warning("FFmpeg automatic installation is only supported on Windows")
-                return False
-                
-            logging.info("Attempting to install FFmpeg using winget...")
-            # Check if winget is available first
-            try:
-                subprocess.run(['winget', '--version'], capture_output=True, timeout=5, check=True)
-            except (FileNotFoundError, subprocess.TimeoutExpired):
-                logging.info("Winget not available or not responding, attempting manual FFmpeg installation...")
-                try:
-                    import requests
-                    import zipfile
-                    import winreg
-                    
-                    # Create FFmpeg directory in AppData
-                    appdata = os.path.join(os.environ['LOCALAPPDATA'], 'FFmpeg')
-                    os.makedirs(appdata, exist_ok=True)
-                    
-                    # Download FFmpeg
-                    url = 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip'
-                    logging.info("Downloading FFmpeg...")
-                    response = requests.get(url, stream=True, timeout=30)
-                    zip_path = os.path.join(appdata, 'ffmpeg.zip')
-                    with open(zip_path, 'wb') as f:
-                        for chunk in response.iter_content(chunk_size=8192):
-                            f.write(chunk)
-                    
-                    # Extract FFmpeg
-                    logging.info("Extracting FFmpeg...")
-                    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                        zip_ref.extractall(appdata)
-                    
-                    # Find the bin directory in extracted contents
-                    extracted_dir = next(d for d in os.listdir(appdata) if d.startswith('ffmpeg-'))
-                    bin_path = os.path.join(appdata, extracted_dir, 'bin')
-                    
-                    # Add to PATH
-                    logging.info("Adding FFmpeg to PATH...")
-                    key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, 'Environment', 0, winreg.KEY_ALL_ACCESS)
-                    current_path = winreg.QueryValueEx(key, 'Path')[0]
-                    if bin_path not in current_path:
-                        new_path = current_path + ';' + bin_path
-                        winreg.SetValueEx(key, 'Path', 0, winreg.REG_EXPAND_SZ, new_path)
-                        winreg.CloseKey(key)
-                        # Notify Windows of environment change
-                        import win32gui, win32con
-                        win32gui.SendMessage(win32con.HWND_BROADCAST, win32con.WM_SETTINGCHANGE, 0, 'Environment')
-                    
-                    # Clean up zip file
-                    os.remove(zip_path)
-                    
-                    logging.info("FFmpeg installed successfully")
-                    # Update current process environment
-                    os.environ['PATH'] = new_path
-                    return True
-                    
-                except Exception as e:
-                    logging.error(f"Error during manual FFmpeg installation: {e}")
-                    return False
-                
-            # Install FFmpeg using winget with auto-accept
-            try:
-                # Install FFmpeg with auto-accept
-                logging.info("Installing FFmpeg (this may take a few minutes)...")
-                process = subprocess.Popen(
-                    ['winget', 'install', '--id', 'Gyan.FFmpeg', '--source', 'winget', '--accept-package-agreements'],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    universal_newlines=True,
-                    bufsize=1  # Line buffered
-                )
-                
-                # Print output in real-time
-                try:
-                    while True:
-                        output = process.stdout.readline()
-                        if output:
-                            output = output.strip()
-                            if output:  # Only log non-empty lines
-                                logging.info(f"winget: {output}")
-                                # If we see the download URL, we know it's starting
-                                if "Downloading" in output:
-                                    logging.info("Download started - please wait...")
-                        error = process.stderr.readline()
-                        if error:
-                            error = error.strip()
-                            if error:  # Only log non-empty lines
-                                logging.error(f"winget error: {error}")
-                        # If process has finished and no more output, break
-                        if output == '' and error == '' and process.poll() is not None:
-                            break
-                except KeyboardInterrupt:
-                    logging.warning("Installation interrupted by user")
-                    process.terminate()
-                    return False
-                
-                if process.returncode == 0:
-                    logging.info("FFmpeg installed successfully")
-                    return True
-                else:
-                    logging.error(f"Failed to install FFmpeg with winget (exit code: {process.returncode})")
-                    # Fallback to manual installation
-                    logging.info("Falling back to manual installation...")
-                    return install_ffmpeg()  # Recursive call will try manual installation
-            except subprocess.TimeoutExpired:
-                logging.error("Winget installation timed out, falling back to manual installation...")
-                return install_ffmpeg()  # Recursive call will try manual installation
-                
-        except Exception as e:
-            logging.error(f"Error installing FFmpeg: {e}")
-            return False
-
-    # Check and install FFmpeg if needed
+    # Check FFmpeg
     if not check_ffmpeg():
-        logging.info("FFmpeg not found on system, attempting to install...")
-        if not install_ffmpeg():
-            logging.warning("Failed to install FFmpeg. Some video processing features may not work.")
-        else:
-            logging.info("FFmpeg installation completed successfully")
+        logging.warning("FFmpeg not found on system. Some video processing features may not work. Please install FFmpeg manually if needed.")
     else:
         logging.info("FFmpeg is already installed")
-    
+
     import socket
     ip_address = socket.gethostbyname(socket.gethostname())
 
@@ -577,7 +467,7 @@ def setup_tray_icon():
         image = Image.open(icon_path)
         import socket
         ip_address = socket.gethostbyname(socket.gethostname())
-        icon = pystray.Icon("CLI Debrid", image, f"CLI Debrid\nMain app: localhost:5000\nBattery: localhost:5001", menu)
+        icon = pystray.Icon("CLI Debrid", image, f"CLI Debrid\nMain app: localhost:{os.environ.get('CLI_DEBRID_PORT', '5000')}\nBattery: localhost:{os.environ.get('CLI_DEBRID_BATTERY_PORT', '5001')}", menu)
         
         # Set up double-click handler
         icon.on_activate = restore_from_tray
@@ -826,7 +716,81 @@ def fix_notification_settings():
     except Exception as e:
         logging.error(f"Error checking notification settings: {e}")
 
-# Update the main function to use a single thread for the metadata battery
+def verify_database_health():
+    """
+    Verifies the health of both media_items.db and cli_battery.db databases.
+    If corruption is detected, backs up the corrupted database and creates a new one.
+    """
+    logging.info("Verifying database health...")
+    
+    # Get database paths
+    db_content_dir = os.environ.get('USER_DB_CONTENT', '/user/db_content')
+    media_items_path = os.path.join(db_content_dir, 'media_items.db')
+    cli_battery_path = os.path.join(db_content_dir, 'cli_battery.db')
+    
+    def check_db_health(db_path, db_name):
+        if not os.path.exists(db_path):
+            logging.warning(f"{db_name} does not exist, will be created during initialization")
+            return True
+            
+        try:
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            
+            # Try to perform a simple query
+            cursor.execute("SELECT 1")
+            cursor.fetchone()
+            
+            # Verify database integrity
+            cursor.execute("PRAGMA integrity_check")
+            result = cursor.fetchone()
+            
+            cursor.close()
+            conn.close()
+            
+            if result[0] != "ok":
+                raise sqlite3.DatabaseError(f"Integrity check failed: {result[0]}")
+                
+            logging.info(f"{db_name} health check passed")
+            return True
+            
+        except sqlite3.DatabaseError as e:
+            logging.error(f"{db_name} is corrupted: {str(e)}")
+            
+            # Create backup of corrupted database
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            backup_path = f"{db_path}.corrupted_{timestamp}"
+            try:
+                shutil.copy2(db_path, backup_path)
+                logging.info(f"Created backup of corrupted {db_name} at {backup_path}")
+            except Exception as backup_error:
+                logging.error(f"Failed to create backup of corrupted {db_name}: {str(backup_error)}")
+            
+            # Delete corrupted database
+            try:
+                os.remove(db_path)
+                logging.info(f"Removed corrupted {db_name}")
+            except Exception as del_error:
+                logging.error(f"Failed to remove corrupted {db_name}: {str(del_error)}")
+                return False
+            
+            return True
+        
+        except Exception as e:
+            logging.error(f"Error checking {db_name} health: {str(e)}")
+            return False
+    
+    # Check both databases
+    media_items_ok = check_db_health(media_items_path, "media_items.db")
+    cli_battery_ok = check_db_health(cli_battery_path, "cli_battery.db")
+    
+    if not media_items_ok or not cli_battery_ok:
+        logging.error("Database health check failed")
+        return False
+    
+    logging.info("Database health check completed successfully")
+    return True
+
 def main():
     global program_runner, metadata_process
     metadata_process = None
@@ -835,20 +799,283 @@ def main():
 
     setup_directories()
     backup_config()
-    backup_database()  # Add the database backup call here
+    backup_database()
+    
+    # Verify database health before proceeding
+    if not verify_database_health():
+        logging.error("Database health check failed. Please check the logs and resolve any issues.")
+        return False
+    
+    # Set up notification handlers
+    setup_crash_handler()
+    register_shutdown_handler()
+    register_startup_handler()
 
     from settings import ensure_settings_file, get_setting, set_setting
     from database import verify_database
     from database.statistics import get_cached_download_stats
+    from not_wanted_magnets import validate_not_wanted_entries
+    from config_manager import load_config, save_config
+
+    # Batch set deprecated settings
+    set_setting('Debug', 'skip_initial_plex_update', False)
+    set_setting('Scraping', 'jackett_seeders_only', True)
+    set_setting('Scraping', 'enable_upgrading_cleanup', True)
+    set_setting('Staleness Threshold', 'staleness_threshold', 7)
+    set_setting('Sync Deletions', 'sync_deletions', True)
+    set_setting('Debrid Provider', 'provider', 'RealDebrid')
+    set_setting('Debug', 'rescrape_missing_files', True)
+    set_setting('Debug', 'anime_renaming_using_anidb', True)
 
     # Add check for Hybrid uncached management setting
     if get_setting('Scraping', 'uncached_content_handling') == 'Hybrid':
-        logging.info("Resetting 'Hybrid' uncached content handling setting to None")
+        logging.info("Converting 'Hybrid' uncached content handling setting to 'None' with hybrid_mode=True")
         set_setting('Scraping', 'uncached_content_handling', 'None')
+        set_setting('Scraping', 'hybrid_mode', True)
+    
+    # Get current settings to check if defaults need to be applied
+    scraping_settings = get_setting('Scraping')
+    debug_settings = get_setting('Debug')
+    
+    if 'disable_adult' not in scraping_settings:
+        set_setting('Scraping', 'disable_adult', True)
+        logging.info("Setting default disable_adult to True")
 
-    if get_setting('Debrid Provider', 'provider') == 'Torbox':
-        logging.info("Resetting Torbox debrid provider to Real-Debrid")
-        set_setting('Debrid Provider', 'provider', 'RealDebrid')
+    if 'enable_plex_removal_caching' not in debug_settings:
+        set_setting('Debug', 'enable_plex_removal_caching', True)
+        logging.info("Setting default enable_plex_removal_caching to True")
+    
+    if 'trakt_early_releases' not in scraping_settings:
+        set_setting('Scraping', 'trakt_early_releases', False)
+        logging.info("Setting default trakt_early_releases to False")
+        
+    # Initialize content_source_check_period if it doesn't exist
+    if 'content_source_check_period' not in debug_settings:
+        set_setting('Debug', 'content_source_check_period', {})
+        logging.info("Initializing content_source_check_period as empty dictionary")
+
+    if get_setting('Debug', 'enabled_separate_anime_folders') is True:
+        set_setting('Debug', 'enable_separate_anime_folders', True)
+        # Remove the old setting key
+        config = load_config()
+        if 'Debug' in config and 'enabled_separate_anime_folders' in config['Debug']:
+            del config['Debug']['enabled_separate_anime_folders']
+            save_config(config)
+        logging.info("Migrating enable_separate_anime_folders to True and removing old key")
+
+    # Add migration for media_type setting
+    config = load_config()
+
+    # Add migration for folder locations
+    if 'Debug' in config:
+        updated = False
+        
+        # Define the default folder names
+        default_folders = {
+            'movies_folder_name': 'Movies',
+            'tv_shows_folder_name': 'TV Shows',
+            'anime_movies_folder_name': 'Anime Movies',
+            'anime_tv_shows_folder_name': 'Anime TV Shows'
+        }
+        
+        # Ensure all folder name keys exist with default values
+        for folder_key, default_value in default_folders.items():
+            if folder_key not in config['Debug']:
+                config['Debug'][folder_key] = default_value
+                updated = True
+                logging.info(f"Created missing folder key {folder_key} with default value: {default_value}")
+        
+        # Create a copy of the items to iterate over
+        debug_items = list(config['Debug'].items())
+        for key, value in debug_items:
+            if key.endswith('_folder_name'):
+                # Get the base key without _folder_name
+                base_key = key.replace('_folder_name', '')
+                # Create new key by appending _folder_name
+                new_key = base_key + '_folder_name'
+                # Keep the existing value if it exists, otherwise use the default
+                if new_key in config['Debug']:
+                    config['Debug'][new_key] = config['Debug'][new_key]  # Preserve existing value
+                else:
+                    config['Debug'][new_key] = default_folders.get(new_key, value)
+                updated = True
+        
+        if updated:
+            save_config(config)
+            logging.info("Successfully migrated folder name settings")
+
+    if 'Content Sources' in config:
+        updated = False
+        for source_id, source_config in config['Content Sources'].items():
+            # Skip the Collected source as it doesn't use media_type
+            if source_id.startswith('Collected_'):
+                continue
+            
+            # Check if media_type is missing
+            if 'media_type' not in source_config:
+                # Create new ordered dict with desired key order
+                new_config = {}
+                # Copy existing keys except display_name
+                for key in source_config:
+                    if key != 'display_name':
+                        new_config[key] = source_config[key]
+                # Add media_type before display_name
+                new_config['media_type'] = 'All'
+                # Add display_name last if it exists
+                if 'display_name' in source_config:
+                    new_config['display_name'] = source_config['display_name']
+                
+                # Replace the old config with the new ordered one
+                config['Content Sources'][source_id] = new_config
+                logging.info(f"Adding default media_type 'All' to content source {source_id}")
+                updated = True
+        
+        # Save the updated config if changes were made
+        if updated:
+            save_config(config)
+            logging.info("Successfully migrated content sources to include media_type setting")
+
+    # Add require_physical_release to existing versions
+    if 'Scraping' in config and 'versions' in config['Scraping']:
+        modified = False
+        for version in config['Scraping']['versions']:
+            if 'require_physical_release' not in config['Scraping']['versions'][version]:
+                config['Scraping']['versions'][version]['require_physical_release'] = False
+                modified = True
+            # Convert string "true"/"false" to boolean
+            elif isinstance(config['Scraping']['versions'][version]['require_physical_release'], str):
+                str_value = str(config['Scraping']['versions'][version]['require_physical_release']).lower()
+                # Let Python's bool and json.dump handle the casing
+                config['Scraping']['versions'][version]['require_physical_release'] = str_value in ('true', 'True', 'TRUE')
+                modified = True
+                logging.info(f"Converting string '{str_value}' to boolean for require_physical_release in version {version}")
+        
+        if modified:
+            save_config(config)
+            logging.info("Added/fixed require_physical_release setting in existing versions")
+
+    # Add migration for notification settings
+    if 'Notifications' in config:
+        notifications_updated = False
+        default_notify_on = {
+            'collected': True,
+            'wanted': False,
+            'scraping': False,
+            'adding': False,
+            'checking': False,
+            'sleeping': False,
+            'unreleased': False,
+            'blacklisted': False,
+            'pending_uncached': False,
+            'upgrading': False,
+            'program_stop': True,
+            'program_crash': True,
+            'program_start': True,
+            'program_pause': True,
+            'program_resume': True,
+            'queue_pause': True,
+            'queue_resume': True,
+            'queue_start': True,
+            'queue_stop': True
+        }
+
+        for notification_id, notification_config in config['Notifications'].items():
+            if notification_config is not None:
+                # Check if notify_on is missing or incomplete
+                if 'notify_on' not in notification_config or not isinstance(notification_config['notify_on'], dict):
+                    notification_config['notify_on'] = default_notify_on.copy()
+                    notifications_updated = True
+                    logging.info(f"Adding default notify_on settings to notification {notification_id}")
+                else:
+                    # Add any missing notification types
+                    for key, default_value in default_notify_on.items():
+                        if key not in notification_config['notify_on']:
+                            notification_config['notify_on'][key] = default_value
+                            notifications_updated = True
+                            logging.info(f"Adding missing notify_on setting '{key}' to notification {notification_id}")
+
+        # Save the updated config if changes were made
+        if notifications_updated:
+            save_config(config)
+            logging.info("Successfully migrated notifications to include all notify_on settings")
+
+    # Add migration for version wake_count setting
+    if 'Scraping' in config and 'versions' in config['Scraping']:
+        versions_updated = False
+        for version_name, version_config in config['Scraping']['versions'].items():
+            # Check if wake_count is missing or is string "None"
+            if 'wake_count' not in version_config or version_config['wake_count'] == "None":
+                version_config['wake_count'] = None  # Set to actual None value
+                versions_updated = True
+                logging.info(f"Adding/fixing wake_count setting to version {version_name}")
+            # Also convert string "None" to actual None if it exists
+            elif isinstance(version_config['wake_count'], str) and version_config['wake_count'].lower() == "none":
+                version_config['wake_count'] = None
+                versions_updated = True
+                logging.info(f"Converting string 'None' to actual None for version {version_name}")
+
+        # Save the updated config if changes were made
+        if versions_updated:
+            save_config(config)
+            logging.info("Successfully migrated version settings to include wake_count")
+
+    # Add migration for bitrate filter settings in versions
+    if 'Scraping' in config and 'versions' in config['Scraping']:
+        versions_updated = False
+        for version_name, version_config in config['Scraping']['versions'].items():
+            # Add min_bitrate_mbps if missing
+            if 'min_bitrate_mbps' not in version_config:
+                version_config['min_bitrate_mbps'] = 0.01
+                versions_updated = True
+                logging.info(f"Adding min_bitrate_mbps setting to version {version_name}")
+            
+            # Add max_bitrate_mbps if missing
+            if 'max_bitrate_mbps' not in version_config:
+                version_config['max_bitrate_mbps'] = float('inf')
+                versions_updated = True
+                logging.info(f"Adding max_bitrate_mbps setting to version {version_name}")
+            
+            # Convert string values to float if needed
+            if isinstance(version_config.get('min_bitrate_mbps'), str):
+                try:
+                    # Handle blank/empty min_bitrate
+                    if not version_config['min_bitrate_mbps'].strip():
+                        version_config['min_bitrate_mbps'] = 0.01
+                    else:
+                        version_config['min_bitrate_mbps'] = float(version_config['min_bitrate_mbps'])
+                    versions_updated = True
+                    logging.info(f"Converting min_bitrate_mbps to float for version {version_name}")
+                except ValueError:
+                    version_config['min_bitrate_mbps'] = 0.01
+                    versions_updated = True
+                    logging.warning(f"Invalid min_bitrate_mbps value in version {version_name}, resetting to 0.01")
+            
+            if isinstance(version_config.get('max_bitrate_mbps'), str):
+                try:
+                    # Handle blank/empty max_bitrate
+                    if not version_config['max_bitrate_mbps'].strip():
+                        version_config['max_bitrate_mbps'] = float('inf')
+                    elif version_config['max_bitrate_mbps'].lower() in ('inf', 'infinity'):
+                        version_config['max_bitrate_mbps'] = float('inf')
+                    else:
+                        version_config['max_bitrate_mbps'] = float(version_config['max_bitrate_mbps'])
+                    versions_updated = True
+                    logging.info(f"Converting max_bitrate_mbps to float for version {version_name}")
+                except ValueError:
+                    version_config['max_bitrate_mbps'] = float('inf')
+                    versions_updated = True
+                    logging.warning(f"Invalid max_bitrate_mbps value in version {version_name}, resetting to infinity")
+
+        # Save the updated config if changes were made
+        if versions_updated:
+            save_config(config)
+            logging.info("Successfully migrated version settings to include bitrate filters")
+
+    # Check and set upgrading_percentage_threshold if blank
+    threshold_value = get_setting('Scraping', 'upgrading_percentage_threshold', '0.1')
+    if not str(threshold_value).strip():
+        set_setting('Scraping', 'upgrading_percentage_threshold', '0.1')
+        logging.info("Set blank upgrading_percentage_threshold to default value of 0.1")
 
     # Get battery port from environment variable
     battery_port = int(os.environ.get('CLI_DEBRID_BATTERY_PORT', '5001'))
@@ -859,6 +1086,7 @@ def main():
 
     ensure_settings_file()
     verify_database()
+    validate_not_wanted_entries()
 
     # Initialize download stats cache
     try:
@@ -873,6 +1101,12 @@ def main():
 
     # Fix notification settings if needed
     fix_notification_settings()
+
+    # Validate Plex tokens on startup
+    token_status = validate_plex_tokens()
+    for username, status in token_status.items():
+        if not status['valid']:
+            logging.error(f"Invalid Plex token for user {username}")
 
     # Add the update_media_locations call here
     # update_media_locations()

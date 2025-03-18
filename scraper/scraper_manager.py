@@ -7,6 +7,7 @@ from .mediafusion import scrape_mediafusion_instance
 from .prowlarr import scrape_prowlarr_instance
 from .torrentio import scrape_torrentio_instance
 from .zilean import scrape_zilean_instance
+from .old_nyaa import scrape_nyaa_instance as scrape_old_nyaa_instance
 from settings import get_setting
 
 class ScraperManager:
@@ -18,7 +19,8 @@ class ScraperManager:
             'Prowlarr': scrape_prowlarr_instance,
             'Torrentio': scrape_torrentio_instance,
             'Zilean': scrape_zilean_instance,
-            'Nyaa': scrape_nyaa
+            'Nyaa': scrape_nyaa,
+            'OldNyaa': scrape_old_nyaa_instance
         }
 
     def get_scraper_settings(self, scraper_type):
@@ -67,35 +69,88 @@ class ScraperManager:
             tmdb_id: TMDB ID of the content
         """
         all_results = []
-        #logging.info(f"Scraping all for: {imdb_id}, {title}, {year}, {content_type}, {season}, {episode}, {multi}, {genres}, {episode_formats}, {tmdb_id}")
         is_anime = genres and 'anime' in [genre.lower() for genre in genres]
         is_episode = content_type.lower() == 'episode'
         
-        # For anime episodes, use ONLY Nyaa if enabled
+        # Helper function to run a scraper and handle exceptions
+        def run_scraper(instance, scraper_type, settings):
+            try:
+                if scraper_type in ['Nyaa', 'OldNyaa']:
+                    # Nyaa has a different function signature
+                    if scraper_type == 'Nyaa':
+                        results = self.scrapers[scraper_type](
+                            title=title,
+                            year=year,
+                            content_type=content_type,
+                            season=season,
+                            episode=episode,
+                            episode_formats=episode_formats if is_anime and content_type.lower() == 'episode' else None,
+                            tmdb_id=tmdb_id,
+                            multi=multi
+                        )
+                    else:  # OldNyaa
+                        results = self.scrapers[scraper_type](
+                            instance=instance,
+                            settings=settings,
+                            imdb_id=imdb_id,
+                            title=title,
+                            year=year,
+                            content_type=content_type,
+                            season=season,
+                            episode=episode,
+                            multi=multi
+                        )
+                else:
+                    # Only Jackett accepts genres parameter
+                    if scraper_type == 'Jackett':
+                        results = self.scrapers[scraper_type](instance, settings, imdb_id, title, year, content_type, season, episode, multi, genres)
+                    else:
+                        results = self.scrapers[scraper_type](instance, settings, imdb_id, title, year, content_type, season, episode, multi)
+                
+                logging.info(f"Found {len(results)} results from {instance}")
+                return instance, results
+            except Exception as e:
+                logging.error(f"Error scraping {scraper_type} instance '{instance}': {str(e)}")
+                return instance, []
+        
+        # For anime episodes, use ONLY Nyaa if enabled and it returns results
         if is_anime and is_episode:
             nyaa_settings = self.get_scraper_settings('Nyaa')
+            old_nyaa_settings = self.get_scraper_settings('OldNyaa')
             nyaa_enabled = nyaa_settings.get('enabled', False) if nyaa_settings else False
+            old_nyaa_enabled = old_nyaa_settings.get('enabled', False) if old_nyaa_settings else False
             
-            if nyaa_enabled:
-                logging.info(f"Using Nyaa exclusively for anime episode: {title}")
-                try:
-                    results = self.scrapers['Nyaa'](
-                        title=title,
-                        year=year,
-                        content_type=content_type,
-                        season=season,
-                        episode=episode,
-                        episode_formats=episode_formats,
-                        tmdb_id=tmdb_id
-                    )
-                    if results:
-                        logging.info(f"Found {len(results)} results from Nyaa")
-                        all_results.extend(results)
-                except Exception as e:
-                    logging.error(f"Error scraping with Nyaa: {str(e)}")
-            return all_results
+            if nyaa_enabled or old_nyaa_enabled:
+                logging.info(f"Trying Nyaa/OldNyaa first for anime episode: {title}")
+                
+                # Use ThreadPoolExecutor to run anime scrapers in parallel
+                anime_scraper_tasks = []
+                with ThreadPoolExecutor() as executor:
+                    if old_nyaa_enabled:
+                        anime_scraper_tasks.append(
+                            executor.submit(run_scraper, 'OldNyaa', 'OldNyaa', old_nyaa_settings)
+                        )
+                    
+                    if nyaa_enabled:
+                        anime_scraper_tasks.append(
+                            executor.submit(run_scraper, 'Nyaa', 'Nyaa', nyaa_settings)
+                        )
+                    
+                    # Collect results as they complete
+                    for future in as_completed(anime_scraper_tasks):
+                        instance, results = future.result()
+                        if results:
+                            logging.info(f"Found {len(results)} results from {instance}")
+                            all_results.extend(results)
+                
+                # Only return early if we found results from anime scrapers
+                if all_results:
+                    return all_results
+                logging.info("No results from anime scrapers, falling back to other scrapers")
 
-        # For all other cases (anime movies or non-anime content), proceed with appropriate scrapers
+        # For all other cases (anime movies, non-anime content, or anime episodes with no results from anime scrapers)
+        # Collect all enabled scrapers
+        scraper_tasks = []
         for instance, settings in self.config.get('Scrapers', {}).items():
             current_settings = self.get_scraper_settings(instance)
             
@@ -108,31 +163,26 @@ class ScraperManager:
                 continue
 
             # Skip Nyaa for non-anime content
-            if scraper_type == 'Nyaa' and not is_anime:
+            if scraper_type in ['Nyaa', 'OldNyaa'] and not is_anime:
                 continue
-
-            scrape_func = self.scrapers[scraper_type]
-            try:
-                if scraper_type == 'Nyaa':
-                    # Nyaa has a different function signature
-                    results = scrape_func(
-                        title=title,
-                        year=year,
-                        content_type=content_type,
-                        season=season,
-                        episode=episode,
-                        episode_formats=episode_formats if is_anime and content_type.lower() == 'episode' else None,
-                        tmdb_id=tmdb_id
-                    )
-                else:
-                    # Other scrapers use the original signature
-                    results = scrape_func(instance, current_settings, imdb_id, title, year, content_type, season, episode, multi)
-                    
-                logging.info(f"Found {len(results)} results from {instance}")
-
+                
+            # Skip anime scrapers if we already tried them above
+            if is_anime and is_episode and scraper_type in ['Nyaa', 'OldNyaa']:
+                continue
+                
+            scraper_tasks.append((instance, scraper_type, current_settings))
+        
+        # Run all scrapers in parallel using ThreadPoolExecutor
+        with ThreadPoolExecutor() as executor:
+            futures = [
+                executor.submit(run_scraper, instance, scraper_type, settings)
+                for instance, scraper_type, settings in scraper_tasks
+            ]
+            
+            # Collect results as they complete
+            for future in as_completed(futures):
+                instance, results = future.result()
                 if results:
                     all_results.extend(results)
-            except Exception as e:
-                logging.error(f"Error scraping {scraper_type} instance '{instance}': {str(e)}")
 
         return all_results

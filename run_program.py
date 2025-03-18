@@ -2,14 +2,17 @@ import logging
 import random
 import time
 import os
+import sqlite3
 from initialization import initialize
 from settings import get_setting, get_all_settings
 from content_checkers.overseerr import get_wanted_from_overseerr 
 from content_checkers.collected import get_wanted_from_collected
-from content_checkers.plex_watchlist import get_wanted_from_plex_watchlist, get_wanted_from_other_plex_watchlist
-from content_checkers.trakt import get_wanted_from_trakt_lists, get_wanted_from_trakt_watchlist, get_wanted_from_trakt_collection
+from content_checkers.plex_rss_watchlist import get_wanted_from_plex_rss, get_wanted_from_friends_plex_rss
+from content_checkers.plex_watchlist import get_wanted_from_plex_watchlist, get_wanted_from_other_plex_watchlist, validate_plex_tokens
+from content_checkers.trakt import get_wanted_from_trakt_lists, get_wanted_from_trakt_watchlist, get_wanted_from_trakt_collection, get_wanted_from_friend_trakt_watchlist
 from metadata.metadata import process_metadata, refresh_release_dates, get_runtime, get_episode_airtime
 from content_checkers.mdb_list import get_wanted_from_mdblists
+from content_checkers.content_source_detail import append_content_source_detail
 from database import add_collected_items, add_wanted_items
 from not_wanted_magnets import purge_not_wanted_magnets_file
 import traceback
@@ -27,6 +30,14 @@ from content_checkers.trakt import check_trakt_early_releases
 from debrid.base import TooManyDownloadsError, RateLimitError
 import tempfile
 from api_tracker import api  # Add this import for the api module
+from plexapi.server import PlexServer
+from database.core import get_db_connection
+import json
+from utilities.post_processing import handle_state_change
+from content_checkers.content_cache_management import (
+    load_source_cache, save_source_cache, 
+    should_process_item, update_cache_for_item
+)
 
 queue_logger = logging.getLogger('queue_logger')
 program_runner = None
@@ -81,9 +92,9 @@ class ProgramRunner:
             'Pending Uncached': 3600,
             'Upgrading': 3600,
             'task_plex_full_scan': 3600,
-            'task_debug_log': 60,
+            #'task_debug_log': 60,
             'task_refresh_release_dates': 3600,
-            'task_purge_not_wanted_magnets_file': 604800,
+            #'task_purge_not_wanted_magnets_file': 604800,
             'task_generate_airtime_report': 3600,
             'task_check_service_connectivity': 60,
             'task_send_notifications': 15,  # Run every 0.25 minutes (15 seconds)
@@ -91,8 +102,18 @@ class ProgramRunner:
             'task_check_trakt_early_releases': 3600,  # Run every hour
             'task_reconcile_queues': 300,  # Run every 5 minutes
             'task_heartbeat': 120,  # Run every 2 minutes
-            'task_local_library_scan': 900,  # Run every 5 minutes
+            #'task_local_library_scan': 900,  # Run every 5 minutes
             'task_refresh_download_stats': 300,  # Run every 5 minutes
+            'task_check_plex_files': 60,  # Run every 60 seconds
+            'task_update_show_ids': 21600,  # Run every six hours
+            'task_update_show_titles': 21600,  # Run every six hours
+            'task_update_movie_ids': 21600,  # Run every six hours
+            'task_update_movie_titles': 21600,  # Run every six hours
+            'task_get_plex_watch_history': 24 * 60 * 60,  # Run every 24 hours
+            'task_refresh_plex_tokens': 24 * 60 * 60,  # Run every 24 hours
+            'task_check_database_health': 3600,  # Run every hour
+            'task_run_library_maintenance': 12 * 60 * 60,  # Run every twelve hours
+            'task_verify_symlinked_files': 900,  # Run every 15 minutes
         }
         self.start_time = time.time()
         self.last_run_times = {task: self.start_time for task in self.task_intervals}
@@ -115,16 +136,63 @@ class ProgramRunner:
             'task_check_trakt_early_releases',
             'task_reconcile_queues',
             'task_heartbeat',
-            'task_refresh_download_stats'  # Add the new task
+            'task_refresh_download_stats',
+            'task_update_show_ids',
+            'task_update_show_titles',
+            'task_update_movie_ids',
+            'task_update_movie_titles',
+            'task_refresh_plex_tokens',
+            'task_check_database_health'
         }
+        
+        # Load saved task toggle states from JSON file
+        try:
+            import os
+            import json
+            
+            # Get the user_db_content directory from environment variable
+            db_content_dir = os.environ.get('USER_DB_CONTENT', '/user/db_content')
+            toggles_file_path = os.path.join(db_content_dir, 'task_toggles.json')
+            
+            # Check if file exists
+            if os.path.exists(toggles_file_path):
+                # Load from JSON file
+                with open(toggles_file_path, 'r') as f:
+                    saved_states = json.load(f)
+                
+                # Apply saved states
+                for task_name, enabled in saved_states.items():
+                    normalized_name = self._normalize_task_name(task_name)
+                    if enabled and normalized_name not in self.enabled_tasks:
+                        self.enabled_tasks.add(normalized_name)
+                        logging.info(f"Enabled task from saved settings: {normalized_name}")
+                    elif not enabled and normalized_name in self.enabled_tasks:
+                        self.enabled_tasks.remove(normalized_name)
+                        logging.info(f"Disabled task from saved settings: {normalized_name}")
+        except Exception as e:
+            logging.error(f"Error loading saved task toggle states: {str(e)}")
 
-        if get_setting('File Management', 'file_collection_management') == 'Plex':
-            self.enabled_tasks.add('task_plex_full_scan')
-        else:
-            self.enabled_tasks.add('task_local_library_scan')
+        if get_setting('File Management', 'file_collection_management') == 'Plex' and (
+            get_setting('Plex', 'update_plex_on_file_discovery') or 
+            get_setting('Plex', 'disable_plex_library_checks')
+        ):
+            self.enabled_tasks.add('task_check_plex_files')
+
+        if get_setting('File Management', 'file_collection_management') == 'Symlinked/Local' and (
+            get_setting('File Management', 'plex_url_for_symlink') and 
+            get_setting('File Management', 'plex_token_for_symlink')
+        ):
+            self.enabled_tasks.add('task_verify_symlinked_files')
+
+        if get_setting('Debug', 'not_add_plex_watch_history_items_to_queue', False):
+            self.enabled_tasks.add('task_get_plex_watch_history')
+
+        if get_setting('Debug', 'enable_library_maintenance_task', False):
+            self.enabled_tasks.add('task_run_library_maintenance')
         
         # Add this line to store content sources
         self.content_sources = None
+        self.file_location_cache = {}  # Cache to store known file locations
 
     def task_heartbeat(self):
         random_number = random.randint(1, 100)
@@ -146,11 +214,14 @@ class ProgramRunner:
                 'Overseerr': 900,
                 'MDBList': 900,
                 'Collected': 86400,
-                'Trakt Watchlist': 30,
+                'Trakt Watchlist': 900,
                 'Trakt Lists': 900,
                 'Trakt Collection': 900,
-                'My Plex Watchlist': 30,
-                'Other Plex Watchlist': 900
+                'My Plex Watchlist': 900,
+                'Other Plex Watchlist': 900,
+                'My Plex RSS Watchlist': 900,
+                'My Friends Plex RSS Watchlist': 900,
+                'My Friends Trakt Watchlist': 900
             }
             
             for source, data in self.content_sources.items():
@@ -201,20 +272,28 @@ class ProgramRunner:
         return should_run
 
     def task_check_service_connectivity(self):
-        # logging.debug("Checking service connectivity")
+        """Check connectivity to required services"""
         from routes.program_operation_routes import check_service_connectivity
-        if check_service_connectivity():
+        connectivity_ok, failed_services = check_service_connectivity()
+        if connectivity_ok:
             logging.debug("Service connectivity check passed")
         else:
             logging.error("Service connectivity check failed")
-            self.handle_connectivity_failure()
+            self.handle_connectivity_failure(failed_services)
 
-    def handle_connectivity_failure(self):
+    def handle_connectivity_failure(self, failed_services=None):
         from routes.program_operation_routes import stop_program, check_service_connectivity
         from extensions import app  # Import the Flask app
 
-        logging.warning("Pausing program queue due to connectivity failure")
-        self.pause_reason = "Connectivity failure - waiting for services to be available"
+        # Create a descriptive message about which services failed
+        if failed_services and len(failed_services) > 0:
+            failed_services_str = ", ".join(failed_services)
+            reason = f"Connectivity failure - {failed_services_str} unavailable"
+        else:
+            reason = "Connectivity failure - waiting for services to be available"
+            
+        logging.warning(f"Pausing program queue due to connectivity failure: {reason}")
+        self.pause_reason = reason
         self.pause_queue()
         
         # Set the initial failure time if not already set
@@ -229,26 +308,29 @@ class ProgramRunner:
 
         if not self.connectivity_failure_time:
             return
-
-        current_time = time.time()
-        time_since_failure = current_time - self.connectivity_failure_time
-        
-        # Check every minute
+            
+        # Check if we should retry connectivity check
+        time_since_failure = time.time() - self.connectivity_failure_time
         if time_since_failure >= 60 * (self.connectivity_retry_count + 1):
             self.connectivity_retry_count += 1
             
             try:
-                if check_service_connectivity():
+                connectivity_ok, failed_services = check_service_connectivity()
+                if connectivity_ok:
                     logging.info("Service connectivity restored")
                     self.connectivity_failure_time = None
                     self.connectivity_retry_count = 0
                     self.resume_queue()
                     return
             except Exception as e:
-                logging.error(f"Error checking connectivity: {str(e)}")
-
+                logging.error(f"Error checking service connectivity: {str(e)}")
+                
             logging.warning(f"Service connectivity check failed. Retry {self.connectivity_retry_count}/5")
-            self.pause_reason = f"Connectivity failure - waiting for services to be available (Retry {self.connectivity_retry_count}/5)"
+            if failed_services and len(failed_services) > 0:
+                failed_services_str = ", ".join(failed_services)
+                self.pause_reason = f"Connectivity failure - {failed_services_str} unavailable (Retry {self.connectivity_retry_count}/5)"
+            else:
+                self.pause_reason = f"Connectivity failure - waiting for services to be available (Retry {self.connectivity_retry_count}/5)"
 
             # After 5 minutes (5 retries), stop the program
             if self.connectivity_retry_count >= 5:
@@ -262,7 +344,7 @@ class ProgramRunner:
     def pause_queue(self):
         from queue_manager import QueueManager
         
-        QueueManager().pause_queue()
+        QueueManager().pause_queue(reason=self.pause_reason)
         self.queue_paused = True
         logging.info("Queue paused")
 
@@ -274,7 +356,6 @@ class ProgramRunner:
         self.pause_reason = None  # Clear pause reason on resume
         logging.info("Queue resumed")
 
-    # Update this method to use the cached content sources
     def process_queues(self):
         try:
             # Check connectivity status if we're in a failure state
@@ -391,13 +472,22 @@ class ProgramRunner:
     def process_content_source(self, source, data):
         source_type = source.split('_')[0]
         versions = data.get('versions', {})
+        source_media_type = data.get('media_type', 'All')
 
-        logging.debug(f"Processing content source: {source} (type: {source_type})")
+        logging.debug(f"Processing content source: {source} (type: {source_type}, media_type: {source_media_type})")
 
         try:
+            # Load cache for this source
+            source_cache = load_source_cache(source)
+            logging.debug(f"Initial cache state for {source}: {len(source_cache)} entries")
+            cache_skipped = 0
+            items_processed = 0
+            total_items = 0
+            media_type_skipped = 0
+
             wanted_content = []
             if source_type == 'Overseerr':
-                wanted_content = get_wanted_from_overseerr()
+                wanted_content = get_wanted_from_overseerr(versions)
             elif source_type == 'MDBList':
                 mdblist_urls = data.get('urls', '').split(',')
                 for mdblist_url in mdblist_urls:
@@ -405,10 +495,9 @@ class ProgramRunner:
                     wanted_content.extend(get_wanted_from_mdblists(mdblist_url, versions))
             elif source_type == 'Trakt Watchlist':
                 try:
-                    wanted_content = get_wanted_from_trakt_watchlist()
+                    wanted_content = get_wanted_from_trakt_watchlist(versions)
                 except (ValueError, api.exceptions.RequestException) as e:
                     logging.error(f"Failed to fetch Trakt watchlist: {str(e)}")
-                    # Don't raise here - allow other content sources to be processed
                     return
             elif source_type == 'Trakt Lists':
                 trakt_lists = data.get('trakt_lists', '').split(',')
@@ -418,14 +507,21 @@ class ProgramRunner:
                         wanted_content.extend(get_wanted_from_trakt_lists(trakt_list, versions))
                     except (ValueError, api.exceptions.RequestException) as e:
                         logging.error(f"Failed to fetch Trakt list {trakt_list}: {str(e)}")
-                        # Continue to next list instead of failing completely
                         continue
             elif source_type == 'Trakt Collection':
-                wanted_content = get_wanted_from_trakt_collection()
+                wanted_content = get_wanted_from_trakt_collection(versions)
+            elif source_type == 'Friends Trakt Watchlist':
+                wanted_content = get_wanted_from_friend_trakt_watchlist(data, versions)
             elif source_type == 'Collected':
                 wanted_content = get_wanted_from_collected()
             elif source_type == 'My Plex Watchlist':
                 wanted_content = get_wanted_from_plex_watchlist(versions)
+            elif source_type == 'My Plex RSS Watchlist':
+                plex_rss_url = data.get('url', '')
+                wanted_content = get_wanted_from_plex_rss(plex_rss_url, versions)
+            elif source_type == 'My Friends Plex RSS Watchlist':
+                plex_rss_url = data.get('url', '')
+                wanted_content = get_wanted_from_friends_plex_rss(plex_rss_url, versions)
             elif source_type == 'Other Plex Watchlist':
                 other_watchlists = []
                 for source_id, source_data in self.get_content_sources().items():
@@ -452,39 +548,96 @@ class ProgramRunner:
                 logging.warning(f"Unknown source type: {source_type}")
                 return
 
-            logging.debug(f"Retrieved wanted content from {source}: {len(wanted_content)} items")
-
             if wanted_content:
-                total_items = 0
                 if isinstance(wanted_content, list) and len(wanted_content) > 0 and isinstance(wanted_content[0], tuple):
-                    # Handle list of tuples
+                    # Handle list of tuples (e.g., from Plex sources)
                     for items, item_versions in wanted_content:
-                        try:
-                            processed_items = process_metadata(items)
+                        logging.debug(f"Processing batch of {len(items)} items from {source}")
+                        
+                        # Filter items by media type first
+                        if source_media_type != 'All' and not source_type.startswith('Collected'):
+                            items = [
+                                item for item in items
+                                if (source_media_type == 'Movies' and item.get('media_type') == 'movie') or
+                                   (source_media_type == 'Shows' and item.get('media_type') == 'tv')
+                            ]
+                            media_type_skipped += len(items) - len(items)
+                        
+                        # Then filter items based on cache
+                        items_to_process = [
+                            item for item in items 
+                            if should_process_item(item, source, source_cache)
+                        ]
+                        items_skipped = len(items) - len(items_to_process)
+                        cache_skipped += items_skipped
+                        
+                        if items_to_process:
+                            processed_items = process_metadata(items_to_process)
                             if processed_items:
-                                all_items = processed_items.get('movies', []) + processed_items.get('episodes', [])
+                                all_items = processed_items.get('movies', []) + processed_items.get('episodes', []) + processed_items.get('anime', [])
+                                
+                                # Set content source and detail for each item
                                 for item in all_items:
                                     item['content_source'] = source
+                                    item = append_content_source_detail(item, source_type=source_type)
+                                
+                                # Update cache for the original items (pre-metadata processing)
+                                for item in items_to_process:
+                                    update_cache_for_item(item, source, source_cache)
+                                
                                 add_wanted_items(all_items, item_versions or versions)
                                 total_items += len(all_items)
-                        except Exception as e:
-                            logging.error(f"Error processing items from {source}: {str(e)}")
-                            logging.error(traceback.format_exc())
+                                items_processed += len(items_to_process)
                 else:
                     # Handle single list of items
-                    try:
-                        processed_items = process_metadata(wanted_content)
+                    logging.debug(f"Processing batch of {len(wanted_content)} items from {source}")
+                    
+                    # Filter items by media type first
+                    if source_media_type != 'All' and not source_type.startswith('Collected'):
+                        wanted_content = [
+                            item for item in wanted_content
+                            if (source_media_type == 'Movies' and item.get('media_type') == 'movie') or
+                               (source_media_type == 'Shows' and item.get('media_type') == 'tv')
+                        ]
+                        media_type_skipped += len(wanted_content) - len(wanted_content)
+                    
+                    # Then filter items based on cache
+                    items_to_process = [
+                        item for item in wanted_content 
+                        if should_process_item(item, source, source_cache)
+                    ]
+                    items_skipped = len(wanted_content) - len(items_to_process)
+                    cache_skipped += items_skipped
+                    
+                    if items_to_process:
+                        processed_items = process_metadata(items_to_process)
                         if processed_items:
-                            all_items = processed_items.get('movies', []) + processed_items.get('episodes', [])
+                            all_items = processed_items.get('movies', []) + processed_items.get('episodes', []) + processed_items.get('anime', [])
+                            
+                            # Set content source and detail for each item
                             for item in all_items:
                                 item['content_source'] = source
+                                item = append_content_source_detail(item, source_type=source_type)
+                            
+                            # Update cache for the original items (pre-metadata processing)
+                            for item in items_to_process:
+                                update_cache_for_item(item, source, source_cache)
+                            
                             add_wanted_items(all_items, versions)
                             total_items += len(all_items)
-                    except Exception as e:
-                        logging.error(f"Error processing items from {source}: {str(e)}")
-                        logging.error(traceback.format_exc())
+                            items_processed += len(items_to_process)
                 
-                logging.info(f"Added {total_items} wanted items from {source}")
+                # Save the updated cache
+                save_source_cache(source, source_cache)
+                logging.debug(f"Final cache state for {source}: {len(source_cache)} entries")
+                
+                stats_msg = f"Added {total_items} wanted items from {source} (processed {items_processed} items"
+                if cache_skipped > 0:
+                    stats_msg += f", skipped {cache_skipped} cached items"
+                if media_type_skipped > 0:
+                    stats_msg += f", skipped {media_type_skipped} items due to media type mismatch"
+                stats_msg += ")"
+                logging.info(stats_msg)
             else:
                 logging.warning(f"No wanted content retrieved from {source}")
 
@@ -619,19 +772,53 @@ class ProgramRunner:
         check_trakt_early_releases()
 
     def update_heartbeat(self):
-        heartbeat_file = os.path.join(tempfile.gettempdir(), 'program_heartbeat')
-        with open(heartbeat_file, 'w') as f:
-            f.write(str(int(time.time())))
+        """Update the heartbeat file directly."""
+        import os
+
+        db_content_dir = os.environ.get('USER_DB_CONTENT', '/user/db_content')
+        heartbeat_file = os.path.join(db_content_dir, 'program_heartbeat')
+        
+        try:
+            # Ensure the directory exists
+            os.makedirs(os.path.dirname(heartbeat_file), exist_ok=True)
+            
+            # Write directly to the heartbeat file
+            with open(heartbeat_file, 'w') as f:
+                f.write(str(int(time.time())))
+                f.flush()
+                os.fsync(f.fileno())
+        except (IOError, OSError) as e:
+            logging.error(f"Failed to update heartbeat file: {e}")
 
     def check_heartbeat(self):
-        heartbeat_file = os.path.join(tempfile.gettempdir(), 'program_heartbeat')
-        if os.path.exists(heartbeat_file):
+        """Check heartbeat file with proper error handling."""
+        import os
+
+        db_content_dir = os.environ.get('USER_DB_CONTENT', '/user/db_content')
+        heartbeat_file = os.path.join(db_content_dir, 'program_heartbeat')
+        
+        if not os.path.exists(heartbeat_file):
+            logging.warning("Heartbeat file does not exist - creating new one")
+            self.update_heartbeat()
+            return True
+
+        try:
             with open(heartbeat_file, 'r') as f:
-                last_heartbeat = int(f.read())
-            if time.time() - last_heartbeat > 300:  # 5 minutes
-                logging.error("Program heartbeat is stale. Restarting.")
-                self.stop()
-                self.start()
+                last_heartbeat = int(f.read().strip())
+                current_time = int(time.time())
+                time_diff = current_time - last_heartbeat
+
+                #logging.debug(f"Time since last heartbeat: {time_diff} seconds")
+                
+                # If more than 5 minutes have passed since last heartbeat
+                if time_diff > 300:
+                    logging.warning(f"Stale heartbeat detected - {time_diff} seconds since last update")
+                    return False
+                
+                return True
+        except (IOError, OSError, ValueError) as e:
+            logging.error(f"Error checking heartbeat: {e}")
+            return False
 
     def task_send_notifications(self):
         db_content_dir = os.environ.get('USER_DB_CONTENT', '/user/db_content/')
@@ -672,7 +859,7 @@ class ProgramRunner:
 
     def task_reconcile_queues(self):
         """Task to reconcile items in Checking state with matching filled_by_file items"""
-        from database.core import get_db_connection
+        import sqlite3
         import logging
         import os
         from datetime import datetime
@@ -689,13 +876,15 @@ class ProgramRunner:
             reconciliation_logger.setLevel(logging.INFO)
 
         conn = get_db_connection()
+        cursor = conn.cursor()
+
         try:
             # Get all items in Checking state
-            cursor = conn.execute('''
+            cursor.execute("""
                 SELECT * FROM media_items 
                 WHERE state = 'Checking' 
                 AND filled_by_file IS NOT NULL
-            ''')
+            """)
             checking_items = cursor.fetchall()
             
             for checking_item in checking_items:
@@ -703,12 +892,12 @@ class ProgramRunner:
                     continue
 
                 # Find matching items with the same filled_by_file
-                cursor = conn.execute('''
+                cursor.execute("""
                     SELECT * FROM media_items 
                     WHERE filled_by_file = ? 
                     AND id != ? 
                     AND state != 'Checking'
-                ''', (checking_item['filled_by_file'], checking_item['id']))
+                """, (checking_item['filled_by_file'], checking_item['id']))
                 matching_items = cursor.fetchall()
 
                 for matching_item in matching_items:
@@ -722,15 +911,15 @@ class ProgramRunner:
                     )
 
                     # Update the checking item to Collected state with timestamp
-                    conn.execute('''
+                    cursor.execute("""
                         UPDATE media_items 
                         SET state = 'Collected', 
                             collected_at = ? 
                         WHERE id = ?
-                    ''', (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), checking_item['id']))
+                    """, (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), checking_item['id']))
 
                     # Delete the matching item
-                    conn.execute('DELETE FROM media_items WHERE id = ?', (matching_item['id'],))
+                    cursor.execute('DELETE FROM media_items WHERE id = ?', (matching_item['id'],))
                     
                     reconciliation_logger.info(
                         f"Updated checking item (ID={checking_item['id']}) to Collected state and "
@@ -796,6 +985,15 @@ class ProgramRunner:
             else:
                 logging.debug("No items in Checking state to scan for")
 
+    def task_get_plex_watch_history(self):
+        """Task to get Plex watch history"""
+        from utilities.plex_watch_history_functions import sync_get_watch_history_from_plex
+        try:
+            sync_get_watch_history_from_plex()
+            logging.info("Successfully retrieved Plex watch history")
+        except Exception as e:
+            logging.error(f"Error retrieving Plex watch history: {str(e)}")
+
     def task_refresh_download_stats(self):
         """Task to refresh the download stats cache"""
         from database.statistics import get_cached_download_stats
@@ -804,6 +1002,471 @@ class ProgramRunner:
             logging.debug("Download stats cache refreshed")
         except Exception as e:
             logging.error(f"Error refreshing download stats cache: {str(e)}")
+
+    def task_refresh_plex_tokens(self):
+        logging.info("Performing periodic Plex token validation")
+        token_status = validate_plex_tokens()
+        for username, status in token_status.items():
+            if not status['valid']:
+                logging.error(f"Invalid Plex token detected during periodic check for user {username}")
+            else:
+                logging.debug(f"Plex token for user {username} is valid")
+
+    def task_check_plex_files(self):
+        """Check for new files in Plex location and update libraries"""
+        if not get_setting('Plex', 'update_plex_on_file_discovery') and not get_setting('Plex', 'disable_plex_library_checks'):
+            logging.debug("Skipping Plex file check")
+            return
+
+        from database import get_media_item_by_id
+
+        plex_file_location = get_setting('Plex', 'mounted_file_location', default='/mnt/zurg/__all__')
+        if not os.path.exists(plex_file_location):
+            logging.warning(f"Plex file location does not exist: {plex_file_location}")
+            return
+
+        # Get all media items from database that are in Checking state
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        items = cursor.execute('SELECT id, filled_by_title, filled_by_file FROM media_items WHERE state = "Checking"').fetchall()
+        conn.close()
+        logging.info(f"Found {len(items)} media items in Checking state to verify")
+
+        # Check if Plex library checks are disabled
+        if get_setting('Plex', 'disable_plex_library_checks', default=False):
+            logging.info("Plex library checks disabled - marking found files as Collected")
+            updated_items = 0
+            not_found_items = 0
+
+            for item in items:
+                filled_by_title = item['filled_by_title']
+                filled_by_file = item['filled_by_file']
+                
+                if not filled_by_title or not filled_by_file:
+                    continue
+
+                # Check if the file exists in the expected location
+                file_path = os.path.join(plex_file_location, filled_by_title, filled_by_file)
+                title_without_ext = os.path.splitext(filled_by_title)[0]
+                file_path_no_ext = os.path.join(plex_file_location, title_without_ext, filled_by_file)
+                
+                # Check if we've already found this file before
+                cache_key = f"{filled_by_title}:{filled_by_file}"
+                if cache_key in self.file_location_cache and self.file_location_cache[cache_key] == 'exists':
+                    logging.debug(f"Skipping previously verified file: {filled_by_title}")
+                    continue
+
+                if not os.path.exists(file_path) and not os.path.exists(file_path_no_ext):
+                    # Try to find the file anywhere under plex_file_location
+                    from utilities.local_library_scan import find_file
+                    found_path = find_file(filled_by_file, plex_file_location)
+                    if found_path:
+                        logging.info(f"Found file in alternate location: {found_path}")
+                        actual_file_path = found_path
+                        self.file_location_cache[cache_key] = 'exists'
+                    else:
+                        not_found_items += 1
+                        logging.debug(f"File not found on disk in any location:\n  {file_path}\n  {file_path_no_ext}")
+                        continue
+
+                # Use the path that exists (prefer original if both exist)
+                actual_file_path = file_path if os.path.exists(file_path) else file_path_no_ext
+                logging.info(f"Found file on disk: {actual_file_path}")
+                self.file_location_cache[cache_key] = 'exists'
+                
+                # Update item state to Collected
+                conn = get_db_connection()
+                cursor = conn.cursor()
+                now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                cursor.execute('UPDATE media_items SET state = "Collected", collected_at = ? WHERE id = ?', (now, item['id']))
+                conn.commit()
+                conn.close()
+                updated_items += 1
+
+                # Add post-processing call after state update
+                updated_item = get_media_item_by_id(item['id'])
+                if updated_item:
+                    handle_state_change(dict(updated_item))
+
+                # Send notification for collected item
+                try:
+                    from notifications import send_notifications
+                    from routes.settings_routes import get_enabled_notifications_for_category
+                    from extensions import app
+
+                    with app.app_context():
+                        response = get_enabled_notifications_for_category('collected')
+                        if response.json['success']:
+                            enabled_notifications = response.json['enabled_notifications']
+                            if enabled_notifications:
+                                # Get full item details for notification
+                                from database.database_reading import get_media_item_by_id
+                                item_details = get_media_item_by_id(item['id'])
+                                notification_data = {
+                                    'id': item['id'],
+                                    'title': item_details.get('title', 'Unknown Title'),
+                                    'type': item_details.get('type', 'unknown'),
+                                    'year': item_details.get('year', ''),
+                                    'version': item_details.get('version', ''),
+                                    'season_number': item_details.get('season_number'),
+                                    'episode_number': item_details.get('episode_number'),
+                                    'new_state': 'Collected'
+                                }
+                                send_notifications([notification_data], enabled_notifications, notification_category='collected')
+                except Exception as e:
+                    logging.error(f"Failed to send collected notification: {str(e)}")
+
+            logging.info(f"Plex check disabled summary: {updated_items} items marked as Collected, {not_found_items} items not found")
+            if get_setting('Plex', 'disable_plex_library_checks'):
+                logging.info(f"Plex library checks disabled, skipping Plex scans")
+                return
+
+        if not get_setting('Plex', 'url', default=False):
+                return
+
+        try:
+            plex_url = get_setting('Plex', 'url', default='')
+            plex_token = get_setting('Plex', 'token', default='')
+            
+            if not plex_url or not plex_token:
+                logging.warning("Plex URL or token not configured")
+                return
+
+            # Connect to Plex server and log library information
+            plex = PlexServer(plex_url, plex_token)
+            sections = plex.library.sections()
+            logging.info(f"Connected to Plex server, found {len(sections)} library sections")
+            
+            # Log detailed information about each library section
+            for section in sections:
+                logging.info(f"Library Section: {section.title}")
+                logging.info(f"  Type: {section.type}")
+                logging.info(f"  Locations:")
+                for location in section.locations:
+                    logging.info(f"    - {location}")
+                    if not os.path.exists(location):
+                        logging.warning(f"    Warning: Location does not exist: {location}")
+
+            updated_sections = set()  # Track which sections we've updated
+            updated_items = 0
+            not_found_items = 0
+
+            for item in items:
+                filled_by_title = item['filled_by_title']
+                filled_by_file = item['filled_by_file']
+                
+                if not filled_by_title or not filled_by_file:
+                    continue
+
+                # Check if the file exists in the expected location
+                file_path = os.path.join(plex_file_location, filled_by_title, filled_by_file)
+                title_without_ext = os.path.splitext(filled_by_title)[0]
+                file_path_no_ext = os.path.join(plex_file_location, title_without_ext, filled_by_file)
+                
+                # Check if we've already found this file before
+                cache_key = f"{filled_by_title}:{filled_by_file}"
+                if cache_key in self.file_location_cache and self.file_location_cache[cache_key] == 'exists':
+                    logging.debug(f"Skipping previously verified file: {filled_by_title}")
+                    continue
+
+                if not os.path.exists(file_path) and not os.path.exists(file_path_no_ext):
+                    # Try to find the file anywhere under plex_file_location
+                    from utilities.local_library_scan import find_file
+                    found_path = find_file(filled_by_file, plex_file_location)
+                    if found_path:
+                        logging.info(f"Found file in alternate location: {found_path}")
+                        actual_file_path = found_path
+                        self.file_location_cache[cache_key] = 'exists'
+                    else:
+                        not_found_items += 1
+                        logging.debug(f"File not found on disk in any location:\n  {file_path}\n  {file_path_no_ext}")
+                        continue
+
+                # Use the path that exists (prefer original if both exist)
+                actual_file_path = file_path if os.path.exists(file_path) else file_path_no_ext
+                logging.info(f"Found file on disk: {actual_file_path}")
+                self.file_location_cache[cache_key] = 'exists'
+                
+                # Update relevant Plex sections
+                for section in sections:
+
+                    try:
+                        # Update each library location with the expected path structure
+                        for location in section.locations:
+                            expected_path = os.path.join(location, filled_by_title)
+                            logging.debug(f"Updating Plex section '{section.title}' to scan:")
+                            logging.debug(f"  Location: {location}")
+                            logging.debug(f"  Expected path: {expected_path}")
+                            
+                            section.update(path=expected_path)
+                            updated_sections.add(section)
+                            break  # Only need to update each section once
+                            
+                    except Exception as e:
+                        logging.error(f"Failed to update Plex section '{section.title}': {str(e)}", exc_info=True)
+
+            # Log summary of operations
+            logging.info(f"Plex update summary: {updated_items} items updated, {not_found_items} items not found")
+            if updated_sections:
+                logging.info("Updated Plex sections:")
+                for section in updated_sections:
+                    logging.info(f"  - {section.title}")
+            else:
+                logging.info("No Plex sections required updates")
+
+        except Exception as e:
+            logging.error(f"Error during Plex library update: {str(e)}", exc_info=True)
+
+    def task_update_show_ids(self):
+        """Update show IDs (imdb_id and tmdb_id) in the database if they don't match the direct API."""
+        try:
+            from database.maintenance import update_show_ids
+            update_show_ids()
+        except Exception as e:
+            logging.error(f"Error in task_update_show_ids: {str(e)}")
+
+    def task_update_show_titles(self):
+        """Update show titles in the database if they don't match the direct API, storing old titles in title_aliases."""
+        try:
+            from database.maintenance import update_show_titles
+            update_show_titles()
+        except Exception as e:
+            logging.error(f"Error in task_update_show_titles: {str(e)}")
+
+    def task_update_movie_ids(self):
+        """Update movie IDs (imdb_id and tmdb_id) in the database if they don't match the direct API."""
+        try:
+            from database.maintenance import update_movie_ids
+            update_movie_ids()
+        except Exception as e:
+            logging.error(f"Error in task_update_movie_ids: {str(e)}")
+
+    def task_update_movie_titles(self):
+        """Update movie titles in the database if they don't match the direct API, storing old titles in title_aliases."""
+        try:
+            from database.maintenance import update_movie_titles
+            update_movie_titles()
+        except Exception as e:
+            logging.error(f"Error in task_update_movie_titles: {str(e)}")
+
+    def trigger_task(self, task_name):
+        """Manually trigger a task to run immediately."""
+        if task_name not in self.enabled_tasks:
+            # Convert task name to match how it's stored in enabled_tasks
+            task_name_normalized = task_name
+            if task_name.startswith('task_'):
+                task_name_normalized = task_name[5:]  # Remove task_ prefix
+            
+            # For content source tasks, they're stored with spaces in enabled_tasks
+            if '_wanted' in task_name_normalized:
+                task_name_normalized = task_name_normalized.replace('_', ' ')
+                if not task_name_normalized.startswith('task_'):
+                    task_name_normalized = f'task_{task_name_normalized}'
+                
+            if task_name_normalized not in self.enabled_tasks:
+                raise ValueError(f"Task {task_name} is not enabled")
+            task_name = task_name_normalized
+        
+        # Handle queue tasks (which don't have task_ prefix)
+        queue_tasks = [
+            'process_wanted',
+            'process_checking',
+            'process_scraping',
+            'process_adding',
+            'process_unreleased',
+            'process_sleeping',
+            'process_blacklisted',
+            'process_pending_uncached',
+            'process_upgrading'
+        ]
+        
+        # Remove process_ prefix and convert to lower case for comparison
+        task_name_lower = task_name.lower()
+        if task_name_lower.startswith('process_'):
+            task_name_lower = task_name_lower[8:]  # Remove 'process_'
+        elif task_name_lower.startswith('task_'):
+            task_name_lower = task_name_lower[5:]  # Remove 'task_'
+            
+        # Check if this task name (without prefix) matches any queue task
+        for queue_task in queue_tasks:
+            queue_task_lower = queue_task.lower()[8:]  # Remove 'process_' prefix
+            if task_name_lower == queue_task_lower:
+                try:
+                    queue_method = getattr(self.queue_manager, queue_task)  # Use original queue task name
+                    queue_method()
+                    logging.info(f"Manually triggered queue task: {queue_task}")
+                    return
+                except Exception as e:
+                    logging.error(f"Error running queue task {queue_task}: {str(e)}")
+                    raise
+                    
+        # Handle content source tasks
+        if '_wanted' in task_name_lower or ' wanted' in task_name_lower:
+            content_sources = self.get_content_sources()
+            source_id = None
+            
+            # Try to match the task name to a content source
+            task_name_parts = task_name_lower.replace('task_', '').replace('_wanted', ' wanted').split(' wanted')[0]
+            
+            for source in content_sources:
+                if source.lower() == task_name_parts:
+                    source_id = source
+                    break
+                    
+            if source_id and source_id in content_sources:
+                try:
+                    self.process_content_source(source_id, content_sources[source_id])
+                    logging.info(f"Manually triggered content source: {source_id}")
+                    return
+                except Exception as e:
+                    logging.error(f"Error running content source {source_id}: {str(e)}")
+                    raise
+        
+        # If we get here, it's a regular task - ensure it has task_ prefix
+        if not task_name.startswith('task_'):
+            task_name = f'task_{task_name}'
+            
+        task_method = getattr(self, task_name, None)
+        if task_method is None:
+            raise ValueError(f"Task {task_name} does not exist")
+            
+        try:
+            task_method()
+            logging.info(f"Manually triggered task: {task_name}")
+        except Exception as e:
+            logging.error(f"Error running task {task_name}: {str(e)}")
+            raise
+            
+    def enable_task(self, task_name):
+        """Enable a task that was previously disabled."""
+        # Normalize task name to match how it's stored in enabled_tasks
+        normalized_name = self._normalize_task_name(task_name)
+        
+        if normalized_name in self.enabled_tasks:
+            logging.info(f"Task {normalized_name} is already enabled")
+            return True
+            
+        # Add to enabled tasks
+        self.enabled_tasks.add(normalized_name)
+        logging.info(f"Enabled task: {normalized_name}")
+        return True
+        
+    def disable_task(self, task_name):
+        """Disable a task to prevent it from running."""
+        # Normalize task name to match how it's stored in enabled_tasks
+        normalized_name = self._normalize_task_name(task_name)
+        
+        if normalized_name not in self.enabled_tasks:
+            logging.info(f"Task {normalized_name} is already disabled")
+            return True
+            
+        # Remove from enabled tasks
+        self.enabled_tasks.remove(normalized_name)
+        logging.info(f"Disabled task: {normalized_name}")
+        return True
+        
+    def _normalize_task_name(self, task_name):
+        """Normalize task name to match how it's stored in enabled_tasks."""
+        task_name_normalized = task_name
+        
+        # Handle queue tasks (which don't have task_ prefix)
+        queue_names = [
+            'Wanted', 'Scraping', 'Adding', 'Checking', 'Sleeping', 
+            'Unreleased', 'Blacklisted', 'Pending Uncached', 'Upgrading'
+        ]
+        
+        # Check if this is a queue name
+        for queue_name in queue_names:
+            if task_name.lower() == queue_name.lower():
+                return queue_name
+                
+        # Handle task_ prefix
+        if task_name.startswith('task_'):
+            task_name_normalized = task_name
+        else:
+            # Check if it's a content source task
+            if '_wanted' in task_name.lower():
+                # Content source tasks have spaces, not underscores
+                task_name_normalized = task_name.replace('_', ' ')
+                if not task_name_normalized.startswith('task_'):
+                    task_name_normalized = f'task_{task_name_normalized}'
+            else:
+                # Regular task - add task_ prefix if not present
+                if not task_name.startswith('task_'):
+                    task_name_normalized = f'task_{task_name}'
+                    
+        return task_name_normalized
+
+    def task_run_library_maintenance(self):
+        """Run library maintenance tasks."""
+        from database.maintenance import run_library_maintenance
+        run_library_maintenance()
+
+    def task_check_database_health(self):
+        """Periodic task to verify database health and handle any corruption."""
+        from main import verify_database_health
+        
+        try:
+            if not verify_database_health():
+                logging.error("Database health check failed during periodic check")
+                # Pause the queue if database is corrupted
+                self.pause_reason = "Database corruption detected - check logs for details"
+                self.pause_queue()
+                
+                # Send notification about database corruption
+                try:
+                    from notifications import send_program_crash_notification                    
+                    send_program_crash_notification("Database corruption detected - program must be restarted to recreate databases")
+
+                except Exception as e:
+                    logging.error(f"Failed to send database corruption notification: {str(e)}")
+            else:
+                logging.info("Periodic database health check passed")
+        except Exception as e:
+            logging.error(f"Error during periodic database health check: {str(e)}")
+
+    def task_verify_symlinked_files(self):
+        """Verify symlinked files have been properly scanned into Plex."""
+        logging.info("Checking for symlinked files to verify in Plex...")
+        try:
+            # Import here to avoid circular imports
+            from database.symlink_verification import get_verification_stats
+            from utilities.plex_verification import run_plex_verification_scan
+            
+            # Check if there are any unverified files to process
+            stats = get_verification_stats()
+            if stats['unverified'] == 0:
+                logging.info("No unverified files in queue. Skipping verification scan.")
+                return
+            
+            # Alternate between full and recent scans
+            # Use a class attribute to track the last scan type
+            if not hasattr(self, '_last_symlink_scan_was_full'):
+                # Initialize to True so first scan will be recent (gets toggled below)
+                self._last_symlink_scan_was_full = True
+            
+            # Toggle scan type
+            do_full_scan = not self._last_symlink_scan_was_full
+            self._last_symlink_scan_was_full = do_full_scan
+            
+            scan_type = "full" if do_full_scan else "recent"
+            logging.info(f"Running {scan_type} symlink verification scan...")
+            
+            # Run the verification scan
+            verified_count, total_processed = run_plex_verification_scan(
+                max_files=50,
+                recent_only=not do_full_scan
+            )
+            
+            logging.info(f"Verified {verified_count} out of {total_processed} symlinked files in Plex ({scan_type} scan)")
+            
+            # If recent scan found nothing but we have unverified files, force a full scan next time
+            if not do_full_scan and total_processed == 0 and stats['unverified'] > 0:
+                logging.info("Recent scan found no files but unverified files exist. Will run full scan next time.")
+                self._last_symlink_scan_was_full = False
+                
+        except Exception as e:
+            logging.error(f"Error verifying symlinked files: {e}")
 
 def process_overseerr_webhook(data):
     notification_type = data.get('notification_type')
@@ -850,11 +1513,14 @@ def process_overseerr_webhook(data):
         all_items = wanted_content_processed.get('movies', []) + wanted_content_processed.get('episodes', []) + wanted_content_processed.get('anime', [])
         for item in all_items:
             item['content_source'] = 'overseerr_webhook'
+            from content_checkers.content_source_detail import append_content_source_detail
+            item = append_content_source_detail(item, source_type='Overseerr')
         add_wanted_items(all_items, versions)
         logging.info(f"Processed and added wanted item from webhook: {wanted_item}")
 
 def generate_airtime_report():
     logging.info("Generating airtime report for wanted and unreleased items...")
+
     conn = get_db_connection()
     cursor = conn.cursor()
 
@@ -936,13 +1602,13 @@ def append_runtime_airtime(items):
             logging.error(f"Item details: {item}")
             logging.error(traceback.format_exc())
     
-def get_and_add_all_collected_from_plex():
-    if get_setting('File Management', 'file_collection_management', 'Plex') == 'Plex':
+def get_and_add_all_collected_from_plex(bypass=False):
+    if get_setting('File Management', 'file_collection_management') == 'Plex' or bypass:
         logging.info("Getting all collected content from Plex")
-        collected_content = asyncio.run(run_get_collected_from_plex())
-    elif get_setting('File Management', 'file_collection_management', 'Plex') == 'Zurg':
-        logging.info("Getting all collected content from Zurg")
-        collected_content = asyncio.run(run_get_collected_from_zurg())
+        if bypass:
+            collected_content = asyncio.run(run_get_collected_from_plex(bypass=True))
+        else:
+            collected_content = asyncio.run(run_get_collected_from_plex())
 
     if collected_content:
         movies = collected_content['movies']
@@ -959,10 +1625,10 @@ def get_and_add_all_collected_from_plex():
     return None
 
 def get_and_add_recent_collected_from_plex():
-    if get_setting('File Management', 'file_collection_management', 'Plex') == 'Plex':
+    if get_setting('File Management', 'file_collection_management') == 'Plex':
         logging.info("Getting recently added content from Plex")
         collected_content = asyncio.run(run_get_recent_from_plex())
-    elif get_setting('File Management', 'file_collection_management', 'Plex') == 'Zurg':
+    elif get_setting('File Management', 'file_collection_management') == 'Zurg':
         logging.info("Getting recently added content from Zurg")
         collected_content = asyncio.run(run_get_recent_from_zurg())
     
@@ -971,6 +1637,15 @@ def get_and_add_recent_collected_from_plex():
         episodes = collected_content['episodes']
         
         logging.info(f"Retrieved {len(movies)} movies and {len(episodes)} episodes")
+        
+        # Check and fix any unmatched items before adding to database if enabled
+        if get_setting('Debug', 'enable_unmatched_items_check', True):
+            logging.info("Checking and fixing unmatched items before adding to database")
+            from utilities.plex_matching_functions import check_and_fix_unmatched_items
+            collected_content = check_and_fix_unmatched_items(collected_content)
+            # Get updated counts after matching check
+            movies = collected_content['movies']
+            episodes = collected_content['episodes']
         
         # Don't return None if some items were skipped during add_collected_items
         if len(movies) > 0 or len(episodes) > 0:

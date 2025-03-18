@@ -6,6 +6,7 @@ import logging
 from .program_operation_routes import program_is_running, program_is_initializing
 from initialization import get_initialization_status
 from cli_battery.app.limiter import limiter
+from settings import get_setting
 import json
 import time
 
@@ -26,12 +27,20 @@ def consolidate_items(items, limit=None):
     for item in items_to_process:
         key = f"{item['title']}_{item.get('year', 'Unknown')}"
         if key not in consolidated:
+            # Handle null or empty release dates
+            release_date = item.get('release_date')
+            if release_date is None or release_date == '' or release_date == 'null':
+                release_date = 'Unknown'
+
             consolidated[key] = {
                 'title': item['title'],
                 'year': item.get('year', 'Unknown'),
                 'versions': set(),
                 'seasons': set(),
-                'release_date': item.get('release_date', 'Unknown')
+                'release_date': release_date,
+                'physical_release_date': item.get('physical_release_date'),
+                'scraping_versions': item.get('scraping_versions', {}),
+                'version': item.get('version')  # Store the version for checking requirements
             }
         consolidated[key]['versions'].add(item.get('version', 'Unknown'))
         if item.get('type') == 'episode' and 'season_number' in item:
@@ -45,7 +54,10 @@ def consolidate_items(items, limit=None):
             'year': data['year'],
             'versions': list(data['versions']),
             'seasons': list(data['seasons']),
-            'release_date': data['release_date']
+            'release_date': data['release_date'],
+            'physical_release_date': data['physical_release_date'],
+            'scraping_versions': data['scraping_versions'],
+            'version': data['version']  # Keep the version for checking requirements
         })
     return result, original_count
 
@@ -176,9 +188,12 @@ def api_queue_contents():
         elif queue_name == 'Wanted':
             for item in items:
                 if 'scrape_time' in item:
-                    if item['scrape_time'] != "Unknown" and item['scrape_time'] != "Invalid date":
-                        scrape_time = datetime.strptime(item['scrape_time'], '%Y-%m-%d %H:%M:%S')
-                        item['formatted_scrape_time'] = scrape_time.strftime('%Y-%m-%d %I:%M %p')
+                    if item['scrape_time'] not in ["Unknown", "Invalid date or time"]:
+                        try:
+                            scrape_time = datetime.strptime(item['scrape_time'], '%Y-%m-%d %H:%M:%S')
+                            item['formatted_scrape_time'] = scrape_time.strftime('%Y-%m-%d %I:%M %p')
+                        except ValueError:
+                            item['formatted_scrape_time'] = item['scrape_time']
                     else:
                         item['formatted_scrape_time'] = item['scrape_time']
         elif queue_name == 'Checking':
@@ -213,10 +228,91 @@ def api_queue_contents():
         "initialization_status": initialization_status
     })
 
+def process_item_for_response(item, queue_name):
+    try:
+        # Add scraping version settings to each item
+        scraping_versions = get_setting('Scraping', 'versions', {})
+        # Handle Infinity values in scraping_versions
+        for version in scraping_versions.values():
+            if isinstance(version, dict):
+                for key, value in version.items():
+                    if value == float('inf'):
+                        version[key] = "Infinity"
+                    elif value == float('-inf'):
+                        version[key] = "-Infinity"
+        
+        item['scraping_versions'] = scraping_versions
+        
+        if queue_name == 'Upgrading':
+            upgrade_info = queue_manager.queues['Upgrading'].upgrade_times.get(item['id'])
+            if upgrade_info:
+                time_added = upgrade_info.get('time_added')
+                if isinstance(time_added, str):
+                    item['time_added'] = time_added
+                elif isinstance(time_added, datetime):
+                    item['time_added'] = time_added.strftime('%Y-%m-%d %H:%M:%S')
+                else:
+                    item['time_added'] = str(time_added)
+            else:
+                item['time_added'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            item['upgrades_found'] = queue_manager.queues['Upgrading'].upgrades_found.get(item['id'], 0)
+        elif queue_name == 'Wanted':
+            if 'scrape_time' in item:
+                if item['scrape_time'] not in ["Unknown", "Invalid date or time"]:
+                    try:
+                        scrape_time = datetime.strptime(item['scrape_time'], '%Y-%m-%d %H:%M:%S')
+                        item['formatted_scrape_time'] = scrape_time.strftime('%Y-%m-%d %I:%M %p')
+                    except ValueError:
+                        item['formatted_scrape_time'] = item['scrape_time']
+                else:
+                    item['formatted_scrape_time'] = item['scrape_time']
+        elif queue_name == 'Checking':
+            # Convert datetime to string for time_added
+            time_added = item.get('time_added', datetime.now())
+            if isinstance(time_added, datetime):
+                item['time_added'] = time_added.strftime('%Y-%m-%d %H:%M:%S')
+            else:
+                item['time_added'] = str(time_added)
+                
+            item['filled_by_file'] = item.get('filled_by_file', 'Unknown')
+            item['filled_by_torrent_id'] = item.get('filled_by_torrent_id', 'Unknown')
+            item['progress'] = item.get('progress', 0)
+            item['state'] = item.get('state', 'unknown')
+            if item.get('filled_by_torrent_id') and item['filled_by_torrent_id'] != 'Unknown':
+                checking_queue = queue_manager.queues['Checking']
+                item['progress'] = checking_queue.get_torrent_progress(item['filled_by_torrent_id'])
+                item['state'] = checking_queue.get_torrent_state(item['filled_by_torrent_id'])
+        elif queue_name == 'Sleeping':
+            if 'wake_count' not in item or item['wake_count'] is None:
+                item['wake_count'] = queue_manager.get_wake_count(item['id'])
+        
+        # Ensure all values are JSON serializable
+        for key, value in item.items():
+            if isinstance(value, datetime):
+                item[key] = value.strftime('%Y-%m-%d %H:%M:%S')
+            elif value == float('inf'):
+                item[key] = "Infinity"
+            elif value == float('-inf'):
+                item[key] = "-Infinity"
+            elif not isinstance(value, (str, int, float, bool, list, dict, type(None))):
+                item[key] = str(value)
+                
+        return item
+    except Exception as e:
+        logging.error(f"Error processing item in queue {queue_name}: {str(e)}")
+        # Return a safe version of the item
+        return {
+            'id': item.get('id', 'unknown'),
+            'title': item.get('title', 'Error processing item'),
+            'error': str(e)
+        }
+
 @queues_bp.route('/api/queue-stream')
 @user_required
 def queue_stream():
-    """Stream queue updates. No caching for streaming endpoints."""
+    """Stream queue updates with a fixed limit of 500 items per queue."""
+    ITEMS_LIMIT = 500  # Fixed limit of 500 items per queue
+
     def generate():
         while True:
             try:
@@ -242,58 +338,36 @@ def queue_stream():
                 
                 # Process all queues with their specific logic
                 queue_counts = {}
+                hidden_counts = {}
                 for queue_name, items in queue_contents.items():
-                    queue_counts[queue_name] = len(items)
+                    # Store total count
+                    total_count = len(items)
+                    queue_counts[queue_name] = total_count
                     
-                    if queue_name == 'Upgrading':
-                        for item in items:
-                            upgrade_info = queue_manager.queues['Upgrading'].upgrade_times.get(item['id'])
-                            if upgrade_info:
-                                time_added = upgrade_info.get('time_added')
-                                if isinstance(time_added, str):
-                                    item['time_added'] = time_added
-                                elif isinstance(time_added, datetime):
-                                    item['time_added'] = time_added.strftime('%Y-%m-%d %H:%M:%S')
-                                else:
-                                    item['time_added'] = str(time_added)
-                            else:
-                                item['time_added'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                            item['upgrades_found'] = queue_manager.queues['Upgrading'].upgrades_found.get(item['id'], 0)
-                    elif queue_name == 'Wanted':
-                        for item in items:
-                            if 'scrape_time' in item:
-                                if item['scrape_time'] != "Unknown" and item['scrape_time'] != "Invalid date":
-                                    scrape_time = datetime.strptime(item['scrape_time'], '%Y-%m-%d %H:%M:%S')
-                                    item['formatted_scrape_time'] = scrape_time.strftime('%Y-%m-%d %I:%M %p')
-                                else:
-                                    item['formatted_scrape_time'] = item['scrape_time']
-                    elif queue_name == 'Checking':
-                        for item in items:
-                            item['time_added'] = item.get('time_added', datetime.now())
-                            item['filled_by_file'] = item.get('filled_by_file', 'Unknown')
-                            item['filled_by_torrent_id'] = item.get('filled_by_torrent_id', 'Unknown')
-                            item['progress'] = item.get('progress', 0)
-                            item['state'] = item.get('state', 'unknown')
-                            if item.get('filled_by_torrent_id') and item['filled_by_torrent_id'] != 'Unknown':
-                                checking_queue = queue_manager.queues['Checking']
-                                item['progress'] = checking_queue.get_torrent_progress(item['filled_by_torrent_id'])
-                                item['state'] = checking_queue.get_torrent_state(item['filled_by_torrent_id'])
-                    elif queue_name == 'Sleeping':
-                        for item in items:
-                            if 'wake_count' not in item or item['wake_count'] is None:
-                                item['wake_count'] = queue_manager.get_wake_count(item['id'])
+                    # Calculate hidden items
+                    hidden_count = max(0, total_count - ITEMS_LIMIT)
+                    if hidden_count > 0:
+                        hidden_counts[queue_name] = hidden_count
+                    
+                    # Apply fixed limit to items
+                    limited_items = items[:ITEMS_LIMIT]
+                    
+                    # Process each item in the queue
+                    processed_items = [process_item_for_response(item, queue_name) for item in limited_items]
+                    queue_contents[queue_name] = processed_items
                     
                     # Pre-consolidate data for specific queues
                     if queue_name == 'Blacklisted':
-                        items, _ = consolidate_items(items)
+                        items, _ = consolidate_items(processed_items)
                         queue_contents[queue_name] = items
                     elif queue_name == 'Unreleased':
-                        items, _ = consolidate_items(items)
+                        items, _ = consolidate_items(processed_items)
                         queue_contents[queue_name] = items
 
                 data = {
                     "contents": queue_contents,
                     "queue_counts": queue_counts,
+                    "hidden_counts": hidden_counts,
                     "program_running": program_running,
                     "program_initializing": program_initializing,
                     "initialization_status": initialization_status

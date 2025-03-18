@@ -18,6 +18,11 @@ def webhook():
     data = request.json
     logging.debug(f"Received webhook: {data}")
     try:
+        # Handle test notifications separately
+        if data.get('notification_type') == 'TEST_NOTIFICATION':
+            logging.info("Received test notification from Overseerr")
+            return jsonify({"status": "success", "message": "Test notification received"}), 200
+
         # If this is a TV show request, look for season information
         if data.get('media', {}).get('media_type') == 'tv':
             # Look for season information in the extra field
@@ -83,7 +88,11 @@ def rclone_webhook():
             if check_local_file_for_item(item, is_webhook=True):
                 logging.info(f"Local file found and symlinked for item {item['id']}")
 
-                if get_setting('File Management', 'plex_url_for_symlink', default=False):
+                # Check for Plex or Emby configuration and update accordingly
+                if get_setting('Debug', 'emby_url', default=False):
+                    # Call Emby update for the item if we have an Emby URL
+                    emby_update_item(item)
+                elif get_setting('File Management', 'plex_url_for_symlink', default=False):
                     # Call Plex update for the item if we have a Plex URL
                     plex_update_item(item)
 

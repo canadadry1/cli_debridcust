@@ -17,6 +17,14 @@
         border-radius: 4px;
     }
 
+    #bulk-early-release {
+        background-color: #e67e22;
+    }
+
+    #bulk-early-release:hover {
+        background-color: #d35400;
+    }    
+    
     #column-selector {
         background-color: #444;
         padding: 15px;
@@ -333,7 +341,7 @@
     }
 
     .bulk-action-btn:disabled {
-        background-color: #666;
+        background-color: #666 !important;
         cursor: not-allowed;
     }
 

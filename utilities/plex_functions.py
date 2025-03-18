@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 
 MAX_CONCURRENT_REQUESTS = 400
 CHUNK_SIZE = 10  # Adjust this value to find the optimal balance
+MAX_RETRIES = 3
+RETRY_DELAY = 1  # seconds
 
 def process_library_names(library_names: str, all_libraries: dict, libraries_by_key: dict) -> list:
     """
@@ -45,9 +47,51 @@ def process_library_names(library_names: str, all_libraries: dict, libraries_by_
     return libraries
 
 async def fetch_data(session: aiohttp.ClientSession, url: str, headers: Dict[str, str], semaphore: asyncio.Semaphore) -> Dict[str, Any]:
-    async with semaphore:
-        async with session.get(url, headers=headers) as response:
-            return await response.json()
+    """Fetch data from Plex with retry logic."""
+    for attempt in range(MAX_RETRIES):
+        try:
+            async with semaphore:
+                async with session.get(url, headers=headers) as response:
+                    if response.status == 200:
+                        try:
+                            return await response.json()
+                        except aiohttp.ContentTypeError:
+                            # If we can't decode JSON, try to get the text content for error details
+                            error_content = await response.text()
+                            logger.error(f"Failed to decode JSON from {url}. Content: {error_content[:200]}...")
+                            if attempt < MAX_RETRIES - 1:
+                                wait_time = RETRY_DELAY * (attempt + 1)
+                                logger.info(f"Retrying in {wait_time} seconds... (Attempt {attempt + 1}/{MAX_RETRIES})")
+                                await asyncio.sleep(wait_time)
+                                continue
+                            else:
+                                return {'MediaContainer': {'Metadata': []}}
+                    elif response.status == 404:
+                        logger.warning(f"Resource not found at {url}")
+                        return {'MediaContainer': {'Metadata': []}}
+                    else:
+                        error_content = await response.text()
+                        logger.error(f"HTTP {response.status} from {url}. Content: {error_content[:200]}...")
+                        
+                        if attempt < MAX_RETRIES - 1:
+                            wait_time = RETRY_DELAY * (attempt + 1)
+                            logger.info(f"Retrying in {wait_time} seconds... (Attempt {attempt + 1}/{MAX_RETRIES})")
+                            await asyncio.sleep(wait_time)
+                            continue
+                        else:
+                            return {'MediaContainer': {'Metadata': []}}
+                            
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            if attempt < MAX_RETRIES - 1:
+                wait_time = RETRY_DELAY * (attempt + 1)
+                logger.warning(f"Request failed: {str(e)}. Retrying in {wait_time} seconds... (Attempt {attempt + 1}/{MAX_RETRIES})")
+                await asyncio.sleep(wait_time)
+                continue
+            else:
+                logger.error(f"Failed after {MAX_RETRIES} attempts: {str(e)}")
+                return {'MediaContainer': {'Metadata': []}}
+    
+    return {'MediaContainer': {'Metadata': []}}
 
 async def get_library_contents(session: aiohttp.ClientSession, plex_url: str, library_key: str, headers: Dict[str, str], semaphore: asyncio.Semaphore) -> List[Dict[str, Any]]:
     url = f"{plex_url}/library/sections/{library_key}/all?includeGuids=1"
@@ -104,6 +148,7 @@ async def process_show(session: aiohttp.ClientSession, plex_url: str, headers: D
                     show_year = show_metadata.get('year')
         except Exception as e:
             logger.error(f"Error retrieving show metadata for {show_title}: {str(e)}")
+            # Continue processing without the metadata
 
     # If we couldn't get the year from metadata, use the show's year as fallback
     if show_year is None:
@@ -121,17 +166,30 @@ async def process_show(session: aiohttp.ClientSession, plex_url: str, headers: D
     all_episodes = []
     for season in seasons:
         season_number = season.get('index')
+        if season_number is None:
+            logger.error(f"Missing season index for show {show_title} in season with ratingKey {season.get('ratingKey')}")
+            continue
+            
         season_key = season['ratingKey']
         
         episodes = await get_season_episodes(session, plex_url, season_key, headers, semaphore)
         
         for episode in episodes:
-            episode_entries = await process_episode(episode, show_title, season_number, show_imdb_id, show_tmdb_id, filtered_show_genres, show_year)
-            all_episodes.extend(episode_entries)
+            try:
+                episode_entries = await process_episode(episode, show_title, season_number, show_imdb_id, show_tmdb_id, filtered_show_genres, show_year)
+                all_episodes.extend(episode_entries)
+            except Exception as e:
+                logger.error(f"Error processing episode {episode.get('title')} of {show_title} S{season_number}: {str(e)}")
+                continue
     
     return all_episodes
 
 async def process_episode(episode: Dict[str, Any], show_title: str, season_number: int, show_imdb_id: str, show_tmdb_id: str, show_genres: List[str], show_year: int = None) -> List[Dict[str, Any]]:
+    # Validate season_number
+    if season_number is None:
+        logger.error(f"Missing season number for episode {episode.get('title')} in show {show_title}")
+        return []
+
     base_episode_data = {
         'title': show_title,
         'episode_title': episode['title'],
@@ -139,7 +197,7 @@ async def process_episode(episode: Dict[str, Any], show_title: str, season_numbe
         'episode_number': episode.get('index'),
         'year': show_year,  # Use show_year instead of episode's year
         'show_year': show_year,  # Add show_year as a separate field
-        'addedAt': episode['addedAt'],
+        'addedAt': episode.get('addedAt'),  # Use .get() with None as default
         'guid': episode.get('guid'),
         'ratingKey': episode['ratingKey'],
         'release_date': episode.get('originallyAvailableAt'),
@@ -170,7 +228,7 @@ async def process_episode(episode: Dict[str, Any], show_title: str, season_numbe
                     metadata, _ = metadata_result
                     if metadata and isinstance(metadata, dict):
                         episode_data = metadata.get('episode', {})
-                        if episode_data:
+                        if episode_data and isinstance(episode_data, dict):  # Add type check
                             # Get first_aired from episode data
                             first_aired = episode_data.get('first_aired')
                             if first_aired:
@@ -185,19 +243,22 @@ async def process_episode(episode: Dict[str, Any], show_title: str, season_numbe
                     if show_metadata and isinstance(show_metadata, dict):
                         # Check if we have season/episode data in show metadata
                         seasons = show_metadata.get('seasons', {})
-                        season_data = seasons.get(str(season_number), {})
-                        if season_data and 'episodes' in season_data:
-                            episodes = season_data['episodes']
-                            # Find the matching episode by number
-                            for ep_num, ep_data in episodes.items():
-                                if str(base_episode_data['episode_number']) == ep_num:
-                                    first_aired = ep_data.get('first_aired')
-                                    if first_aired and not base_episode_data['release_date']:
-                                        base_episode_data['release_date'] = first_aired[:10]
-                                    break
+                        if isinstance(seasons, dict):  # Add type check
+                            season_data = seasons.get(str(season_number), {})
+                            if season_data and isinstance(season_data, dict) and 'episodes' in season_data:  # Add type check
+                                episodes = season_data['episodes']
+                                if isinstance(episodes, dict):  # Add type check
+                                    # Find the matching episode by number
+                                    for ep_num, ep_data in episodes.items():
+                                        if str(base_episode_data['episode_number']) == ep_num:
+                                            first_aired = ep_data.get('first_aired') if isinstance(ep_data, dict) else None  # Add type check
+                                            if first_aired and not base_episode_data['release_date']:
+                                                base_episode_data['release_date'] = first_aired[:10]
+                                            break
                 
         except Exception as e:
             logger.error(f"Error retrieving metadata for {show_title} S{season_number}E{base_episode_data['episode_number']}: {str(e)}")
+            # Continue processing without the metadata
     
     episode_entries = []
     if 'Media' in episode and episode['Media']:
@@ -285,10 +346,14 @@ async def process_movie(movie: Dict[str, Any]) -> List[Dict[str, Any]]:
     logger.debug(f"Processed {len(movie_entries)} entries for movie: {movie['title']}")
     return movie_entries
 
-async def get_collected_from_plex(request='all'):
+async def get_collected_from_plex(request='all', progress_callback=None, bypass=False):
     try:
         start_time = time.time()
         logger.info(f"Starting Plex content collection. Request type: {request}")
+
+        if progress_callback:
+            logger.debug("Calling progress callback: Connecting to Plex server...")
+            progress_callback('scanning', 'Connecting to Plex server...')
 
         plex_url = get_setting('Plex', 'url').rstrip('/')
         plex_token = get_setting('Plex', 'token')
@@ -300,25 +365,47 @@ async def get_collected_from_plex(request='all'):
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
         async with aiohttp.ClientSession() as session:
+            if progress_callback:
+                logger.debug("Calling progress callback: Retrieving library sections...")
+                progress_callback('scanning', 'Retrieving library sections...')
+
             libraries_url = f"{plex_url}/library/sections"
+            logger.debug(f"Fetching library sections from: {libraries_url}")
             libraries_data = await fetch_data(session, libraries_url, headers, semaphore)
             
             # Create mappings for library names and keys
             libraries_by_key = {str(library['key']): library['title'] for library in libraries_data['MediaContainer']['Directory']}
             all_libraries = {library['title']: library['key'] for library in libraries_data['MediaContainer']['Directory']}
             
-            # Process movie and show libraries
-            movie_libraries = process_library_names(get_setting('Plex', 'movie_libraries', ''), all_libraries, libraries_by_key)
-            show_libraries = process_library_names(get_setting('Plex', 'shows_libraries', ''), all_libraries, libraries_by_key)
+            if bypass:
+                # When bypass is true, gather all movie and show libraries
+                movie_libraries = []
+                show_libraries = []
+                for library in libraries_data['MediaContainer']['Directory']:
+                    if library['type'] == 'movie':
+                        movie_libraries.append(str(library['key']))
+                    elif library['type'] == 'show':
+                        show_libraries.append(str(library['key']))
+            else:
+                # Process movie and show libraries from settings
+                movie_libraries = process_library_names(get_setting('Plex', 'movie_libraries', ''), all_libraries, libraries_by_key)
+                show_libraries = process_library_names(get_setting('Plex', 'shows_libraries', ''), all_libraries, libraries_by_key)
             
             logger.info(f"TV Show libraries to process: {show_libraries}")
             logger.info(f"Movie libraries to process: {movie_libraries}")
+
+            if progress_callback:
+                logger.debug("Calling progress callback: Retrieving show library contents...")
+                progress_callback('scanning', 'Retrieving show library contents...')
 
             all_shows = []
             for library_key in show_libraries:
                 shows = await get_library_contents(session, plex_url, library_key, headers, semaphore)
                 all_shows.extend(shows)
             
+            if progress_callback:
+                progress_callback('scanning', 'Retrieving movie library contents...')
+
             all_movies = []
             for library_key in movie_libraries:
                 movies = await get_library_contents(session, plex_url, library_key, headers, semaphore)
@@ -327,33 +414,71 @@ async def get_collected_from_plex(request='all'):
             logger.info(f"Total shows found: {len(all_shows)}")
             logger.info(f"Total movies found: {len(all_movies)}")
             
+            if progress_callback:
+                progress_callback('scanning', f'Processing {len(all_shows)} shows...', {
+                    'total_shows': len(all_shows),
+                    'total_movies': len(all_movies),
+                    'shows_processed': 0,
+                    'movies_processed': 0
+                })
+
             all_episodes = []
             for i in range(0, len(all_shows), CHUNK_SIZE):
                 chunk = all_shows[i:i+CHUNK_SIZE]
                 chunk_episodes = await process_shows_chunk(session, plex_url, headers, semaphore, chunk)
                 all_episodes.extend(chunk_episodes)
-                logger.info(f"Processed {i+len(chunk)}/{len(all_shows)} shows")
-                logger.debug(f"Total episodes: {len(all_episodes)}")
+                
+                if progress_callback:
+                    shows_processed = min(i + CHUNK_SIZE, len(all_shows))
+                    progress_callback('scanning', 
+                        f'Processed {shows_processed}/{len(all_shows)} shows ({len(all_episodes)} episodes found)',
+                        {
+                            'shows_processed': shows_processed,
+                            'total_shows': len(all_shows),
+                            'total_movies': len(all_movies),
+                            'episodes_found': len(all_episodes)
+                        }
+                    )
             
+            if progress_callback:
+                progress_callback('scanning', f'Processing {len(all_movies)} movies...')
+
             all_movies_processed = []
             for i in range(0, len(all_movies), CHUNK_SIZE):
                 chunk = all_movies[i:i+CHUNK_SIZE]
                 chunk_movies = await process_movies_chunk(session, plex_url, headers, semaphore, chunk)
                 all_movies_processed.extend(chunk_movies)
-                logger.info(f"Processed {i+len(chunk)}/{len(all_movies)} movies")
-                logger.debug(f"Total movies: {len(all_movies_processed)}")
+                
+                if progress_callback:
+                    movies_processed = min(i + CHUNK_SIZE, len(all_movies))
+                    progress_callback('scanning', 
+                        f'Processed {movies_processed}/{len(all_movies)} movies',
+                        {
+                            'shows_processed': len(all_shows),
+                            'total_shows': len(all_shows),
+                            'movies_processed': movies_processed,
+                            'total_movies': len(all_movies),
+                            'episodes_found': len(all_episodes)
+                        }
+                    )
            
         end_time = time.time()
         total_time = end_time - start_time
         logger.info(f"Collection complete. Total time: {total_time:.2f} seconds")
         logger.info(f"Collected: {len(all_episodes)} episodes and {len(all_movies_processed)} movies")
-        
-        logger.debug(f"Final episodes list length: {len(all_episodes)}")
-        logger.debug(f"Final movies list length: {len(all_movies_processed)}")
 
         if not all_movies_processed and not all_episodes:
             logger.error("No content retrieved from Plex scan")
             return None
+
+        if progress_callback:
+            progress_callback('complete', 'Scan complete', {
+                'shows_processed': len(all_shows),
+                'total_shows': len(all_shows),
+                'movies_processed': len(all_movies),
+                'total_movies': len(all_movies),
+                'episodes_found': len(all_episodes)
+            })
 
         return {
             'movies': all_movies_processed,
@@ -361,16 +486,18 @@ async def get_collected_from_plex(request='all'):
         }
     except Exception as e:
         logger.error(f"Error collecting content from Plex: {str(e)}", exc_info=True)
-        return None
+        if progress_callback:
+            progress_callback('error', f'Error: {str(e)}')
+        raise
 
-async def run_get_collected_from_plex(request='all'):
+async def run_get_collected_from_plex(request='all', progress_callback=None, bypass=False):
     logger.info("Starting run_get_collected_from_plex")
-    result = await get_collected_from_plex(request)
+    result = await get_collected_from_plex(request, progress_callback, bypass)
     logger.info("Completed run_get_collected_from_plex")
     return result
 
-def sync_run_get_collected_from_plex(request='all'):
-    return asyncio.run(run_get_collected_from_plex(request))
+def sync_run_get_collected_from_plex(request='all', progress_callback=None):
+    return asyncio.run(run_get_collected_from_plex(request, progress_callback))
 
 async def get_recent_from_plex():
     try:
@@ -482,7 +609,8 @@ def filter_genres(genres):
     if not isinstance(genres, list):
         genres = [genres]
     
-    filtered = ['anime'] if any(str(genre).strip().lower() == 'anime' for genre in genres) else []
+    # Convert all genres to lowercase strings and remove duplicates
+    filtered = list(set(str(genre).strip().lower() for genre in genres if genre))
     return filtered
 
 async def process_recent_movie(movie: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -643,84 +771,105 @@ def remove_file_from_plex(item_title, item_path, episode_title=None):
         
         sections = plex.library.sections()
         file_deleted = False
+        max_retries = 3
+        retry_delay = 1  # seconds
         
-        for section in sections:
+        for attempt in range(max_retries):
             try:
-                if section.type == 'show':
-                    # Extract show title from item_title (assuming format "Show Title_...")
-                    show_title = item_title.split('_')[0]
-                    
-                    # Search for the show
-                    shows = section.search(title=show_title)
-                    
-                    for show in shows:
-                        # Get all episodes for the show
-                        try:
-                            episodes = show.episodes()
-                        except Exception as e:
-                            logger.error(f"Error getting episodes for show {show.title}: {str(e)}")
-                            continue
-                        
-                        for episode in episodes:
-                            if hasattr(episode, 'media'):
-                                for media in episode.media:
-                                    for part in media.parts:
-                                        if os.path.basename(part.file) == os.path.basename(item_path):
-                                            logger.info(f"Found matching file in episode: {episode.title}")
-                                            # Refresh media before deletion
-                                            try:
-                                                episode.refresh()
-                                                logger.info(f"Refreshed episode: {episode.title}")
-                                            except Exception as e:
-                                                logger.error(f"Error refreshing episode: {str(e)}")
-                                            media.delete()
-                                            logger.info(f"Successfully deleted media containing file: {part.file}")
-                                            file_deleted = True
-                                            return True
-                            else:
-                                logger.warning(f"No media found for episode: {episode.title}")
-                else:
-                    # For movies and other types, use the existing search method
-                    items = section.search(title=item_title)
-                    
-                    for item in items:
-                        logger.info(f"Checking item: {item.title}")
-                        if hasattr(item, 'media'):
-                            for media in item.media:
-                                for part in media.parts:
-                                    logger.info(f"Checking file: {part.file}")
-                                    if os.path.basename(part.file) == os.path.basename(item_path):
-                                        logger.info(f"Found matching file in item: {item.title}")
-                                        # Refresh media before deletion
-                                        try:
-                                            item.refresh()
-                                            logger.info(f"Refreshed item: {item.title}")
-                                        except Exception as e:
-                                            logger.error(f"Error refreshing item: {str(e)}")
-                                        media.delete()
-                                        logger.info(f"Successfully deleted media containing file: {part.file} from item: {item.title}")
-                                        file_deleted = True
-                                        return True
+                if attempt > 0:
+                    logger.info(f"Retry attempt {attempt + 1}/{max_retries} for removing {item_title}")
+                    time.sleep(retry_delay)
+                
+                for section in sections:
+                    try:
+                        if section.type == 'show':
+                            # Extract show title from item_title (assuming format "Show Title_...")
+                            show_title = item_title.split('_')[0]
+                            
+                            # Search for the show
+                            shows = section.search(title=show_title)
+                            
+                            for show in shows:
+                                # Get all episodes for the show
+                                try:
+                                    episodes = show.episodes()
+                                except Exception as e:
+                                    logger.error(f"Error getting episodes for show {show.title}: {str(e)}")
+                                    continue
+                                
+                                for episode in episodes:
+                                    if hasattr(episode, 'media'):
+                                        for media in episode.media:
+                                            for part in media.parts:
+                                                if os.path.basename(part.file) == os.path.basename(item_path):
+                                                    logger.info(f"Found matching file in episode: {episode.title}")
+                                                    # Refresh media before deletion
+                                                    try:
+                                                        episode.refresh()
+                                                        logger.info(f"Refreshed episode: {episode.title}")
+                                                        # Wait for Plex to process the refresh
+                                                        time.sleep(1)
+                                                        media.delete()
+                                                        logger.info(f"Successfully deleted media containing file: {part.file}")
+                                                        file_deleted = True
+                                                        return True
+                                                    except Exception as e:
+                                                        logger.error(f"Error during episode refresh/delete: {str(e)}")
+                                                        if attempt == max_retries - 1:  # Last attempt
+                                                            raise  # Re-raise on final attempt
+                                                        continue
+                                    else:
+                                        logger.warning(f"No media found for episode: {episode.title}")
                         else:
-                            logger.warning(f"No media found for item: {item.title}")
+                            # For movies and other types, use the existing search method
+                            items = section.search(title=item_title)
+                            
+                            for item in items:
+                                logger.info(f"Checking item: {item.title}")
+                                if hasattr(item, 'media'):
+                                    for media in item.media:
+                                        for part in media.parts:
+                                            logger.info(f"Checking file: {part.file}")
+                                            if os.path.basename(part.file) == os.path.basename(item_path):
+                                                logger.info(f"Found matching file in item: {item.title}")
+                                                # Refresh media before deletion
+                                                try:
+                                                    item.refresh()
+                                                    logger.info(f"Refreshed item: {item.title}")
+                                                    # Wait for Plex to process the refresh
+                                                    time.sleep(1)
+                                                    media.delete()
+                                                    logger.info(f"Successfully deleted media containing file: {part.file} from item: {item.title}")
+                                                    file_deleted = True
+                                                    return True
+                                                except Exception as e:
+                                                    logger.error(f"Error during item refresh/delete: {str(e)}")
+                                                    if attempt == max_retries - 1:  # Last attempt
+                                                        raise  # Re-raise on final attempt
+                                                    continue
+                                else:
+                                    logger.warning(f"No media found for item: {item.title}")
+                    except Exception as e:
+                        logger.error(f"Error processing section {section.title}: {str(e)}")
+                        if attempt == max_retries - 1:  # Last attempt
+                            raise  # Re-raise on final attempt
+                        continue
                 
                 if not file_deleted:
-                    logger.warning(f"No matching files found in section {section.title} for title: {item_title}, episode title: {episode_title}, and file name: {item_path}")
+                    logger.warning(f"No matching files found in section {section.title} for title: {item_title}, episode title: {episode_title}")
+                    if attempt < max_retries - 1:  # Not the last attempt
+                        continue
+                    
             except Exception as e:
-                logger.error(f"Unexpected error in section {section.title}: {str(e)}", exc_info=True)
-        
-        if not file_deleted:
-            logger.warning(f"No matching files found in any Plex library section for title: {item_title}, episode title: {episode_title}, and file name: {item_path}")
-            return False
-        
-    except plexapi.exceptions.Unauthorized:
-        logger.error("Unauthorized: Please check your Plex token")
-        return False
-    except plexapi.exceptions.NotFound:
-        logger.error(f"Plex server not found at {plex_url}")
-        return False
+                logger.error(f"Error during attempt {attempt + 1}: {str(e)}")
+                if attempt == max_retries - 1:  # Last attempt
+                    raise  # Re-raise on final attempt
+                continue
+                
+        return file_deleted
+            
     except Exception as e:
-        logger.error(f"Unexpected error removing file from Plex: {str(e)}", exc_info=True)
+        logger.error(f"Error removing file from Plex: {str(e)}")
         return False
 
 def remove_symlink_from_plex(item_title: str, item_path: str, episode_title: str = None) -> bool:
@@ -913,73 +1062,6 @@ def remove_symlink_from_plex(item_title: str, item_path: str, episode_title: str
     logger.error(f"Failed to remove {'episode' if episode_title else 'movie'} after {max_retries} attempts")
     return False
 
-def force_match_with_tmdb(title: str, tmdb_id: str) -> bool:
-    """
-    Force matches a Plex item with a specific TMDB ID.
-    
-    Args:
-        title (str): The title of the item to match (this is actually the filename)
-        tmdb_id (str): The TMDB ID to match with
-        
-    Returns:
-        bool: True if successful, False otherwise
-    """
-    try:
-        # Get Plex connection details from settings
-        baseurl = get_setting("Plex", "url", default="http://localhost:32400")
-        token = get_setting("Plex", "token")
-        
-        if not token:
-            logging.error("No Plex token found in settings")
-            return False
-            
-        # Connect to Plex
-        plex = PlexServer(baseurl, token)
-        
-        # Get the basename without extension as that's what Plex uses as title
-        search_filename = os.path.splitext(os.path.basename(title))[0]
-        logging.info(f"Searching for item with title: {search_filename}")
-        
-        # Search directly by title
-        items = plex.library.search(title=search_filename)
-        if not items:
-            logging.error(f"Could not find item with title '{search_filename}' in Plex")
-            return False
-            
-        for item in items:
-            try:
-                logging.info(f"Found item: {item.title}")
-                # Unmatch current match if any
-                item.unmatch()
-                
-                # Force match with TMDB
-                matches = item.matches(agent='themoviedb')
-                logging.info(f"Found {len(matches)} potential TMDB matches")
-                
-                # Find the match with our TMDB ID
-                for match in matches:
-                    guid = str(match.guid)
-                    logging.debug(f"Checking match with guid: {guid}")
-                    # Extract TMDB ID from guid, ignoring any parameters
-                    if '?' in guid:
-                        guid = guid.split('?')[0]
-                    if guid.endswith(tmdb_id):
-                        item.fixMatch(match)
-                        logging.info(f"Successfully matched '{search_filename}' with TMDB ID {tmdb_id}")
-                        return True
-                
-                logging.warning(f"Could not find TMDB ID {tmdb_id} in matches for '{search_filename}'")
-                
-            except Exception as e:
-                logging.error(f"Error matching individual item: {str(e)}")
-                continue
-                
-        return False
-        
-    except Exception as e:
-        logging.error(f"Error force matching item in Plex: {str(e)}")
-        return False
-
 def plex_update_item(item: Dict[str, Any]) -> bool:
     try:
         plex_url = get_setting('File Management', 'plex_url_for_symlink', default='')
@@ -991,10 +1073,16 @@ def plex_update_item(item: Dict[str, Any]) -> bool:
             
         plex = PlexServer(plex_url, plex_token)
         
-        # Get the file location from the item
-        file_location = get_media_item_by_id(item['id'])['location_on_disk']
+        # Use the full_path directly from the item data passed from verification
+        file_location = item.get('full_path')
         if not file_location:
-            logger.error("No file location provided in item")
+            # Fallback to database lookup if full_path is not in the item
+            media_item = get_media_item_by_id(item.get('media_item_id') or item.get('id'))
+            if media_item:
+                file_location = media_item.get('location_on_disk')
+            
+        if not file_location:
+            logger.error(f"No file location found for item: {item.get('title', 'Unknown')}")
             return False
             
         # Get the directory containing the file

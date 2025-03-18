@@ -67,7 +67,18 @@ def load_config():
         return {}
 
 def load_env_config():
-    """Load configuration from .env file if it exists."""
+    """Load configuration from environment variable or .env file if it exists."""
+    # First try to load from environment variable
+    env_config = os.environ.get('CLI_DEBRID_CONFIG_JSON')
+    if env_config:
+        try:
+            config = json.loads(env_config)
+            logging.info("Configuration loaded from CLI_DEBRID_CONFIG_JSON environment variable")
+            return config
+        except json.JSONDecodeError as e:
+            logging.error(f"Failed to parse CLI_DEBRID_CONFIG_JSON environment variable: {str(e)}")
+            
+    # Fallback to .env file if environment variable not found or invalid
     # Get the project root directory (where settings.py is located)
     root_dir = os.path.dirname(os.path.abspath(__file__))
     env_file = os.path.join(root_dir, '.env')
@@ -76,7 +87,7 @@ def load_env_config():
     if not os.path.exists(env_file):
         env_file = os.path.join(CONFIG_DIR, '.env')
         if not os.path.exists(env_file):
-            #logging.debug(f".env file not found in root or config dir: {env_file}")
+            logging.info("No .env file found in root or config dir - using default configuration")
             return {}
     
     try:
@@ -91,7 +102,7 @@ def load_env_config():
                     except ValueError:
                         continue
         
-        #logging.debug("Loaded traditional environment variables from .env")
+        logging.debug(f"Loaded traditional environment variables from {env_file}")
         
         # Now load JSON config
         with open(env_file, 'r') as f:
@@ -114,7 +125,7 @@ def load_env_config():
             try:
                 json_content = ''.join(json_lines)
                 config = json.loads(json_content)
-                #logging.debug("Successfully parsed multi-line JSON config")
+                logging.info(f"Configuration loaded from multi-line JSON block in {env_file}")
                 return config
             except json.JSONDecodeError as e:
                 logging.debug(f"Failed to parse multi-line JSON: {str(e)}")
@@ -124,14 +135,14 @@ def load_env_config():
             if line.startswith('CONFIG_JSON='):
                 config_json = line[12:].strip()  # Remove CONFIG_JSON= prefix
                 config = json.loads(config_json)
-                #logging.debug("Successfully parsed single-line JSON config")
+                logging.info(f"Configuration loaded from single-line CONFIG_JSON in {env_file}")
                 return config
         
-        #logging.debug("No valid CONFIG_JSON found in .env file")
+        logging.info(f"No valid JSON configuration found in {env_file} - using default configuration")
         return {}
             
     except (IOError, json.JSONDecodeError) as e:
-        logging.error(f"Failed to load or parse config from .env file: {str(e)}")
+        logging.error(f"Failed to load or parse config from {env_file}: {str(e)}")
         return {}
 
 def save_config(config):
@@ -345,12 +356,17 @@ def ensure_settings_file():
         if 'Scraping' not in config:
             config['Scraping'] = {}
         if 'versions' not in config['Scraping'] or not config['Scraping']['versions'] or is_new_file:
+            # Get the default version settings from schema
+            version_defaults = SETTINGS_SCHEMA['Scraping']['versions']['schema']
+            default_version_config = {}
+            for key, value in version_defaults.items():
+                default_version_config[key] = value.get('default')
+            
             config['Scraping']['versions'] = {
-                'Default': {
-                }
+                'Default': default_version_config
             }
 
-        # Ensure Debrid Provider is set to Torbox if not already set
+        # Ensure Debrid Provider is set to Real-Debrid if not already set
         if 'Debrid Provider' not in config:
             config['Debrid Provider'] = {}
         if 'provider' not in config['Debrid Provider'] or not config['Debrid Provider']['provider']:
@@ -364,6 +380,14 @@ def ensure_settings_file():
                 config['Debrid Provider']['api_key'] = config['RealDebrid']['api_key']
                 # Optionally set provider to RealDebrid since we found a key
                 config['Debrid Provider']['provider'] = 'RealDebrid'
+
+        config['Reverse Parser'] = {
+            'version_terms': {
+                'Default': []
+            },
+            'default_version': 'Default',
+            'version_order': ['Default']
+        }
 
         # Now try to load and merge .env config
         env_config = load_env_config()

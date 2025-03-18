@@ -7,6 +7,17 @@ from routes.models import admin_required, onboarding_required
 from .utils import is_user_system_enabled
 import traceback
 import json
+import os
+import platform
+from datetime import datetime
+from notifications import (
+    send_telegram_notification, 
+    send_discord_notification, 
+    send_ntfy_notification, 
+    send_email_notification
+)
+import re
+import time
 
 settings_bp = Blueprint('settings', __name__)
 
@@ -27,6 +38,45 @@ def content_sources_types():
         'source_types': source_types,
         'settings': SETTINGS_SCHEMA['Content Sources']['schema']
     })
+
+@settings_bp.route('/content-sources/trakt-friends')
+def get_trakt_friends():
+    """Get a list of authorized Trakt friends for the dropdown"""
+    try:
+        friends = []
+        trakt_friends_dir = os.environ.get('USER_CONFIG', '/user/config')
+        trakt_friends_dir = os.path.join(trakt_friends_dir, 'trakt_friends')
+        
+        # List all files in the trakt_friends_dir
+        if os.path.exists(trakt_friends_dir):
+            for filename in os.listdir(trakt_friends_dir):
+                if filename.endswith('.json'):
+                    try:
+                        # Extract auth_id from filename
+                        auth_id = filename.replace('.json', '')
+                        
+                        with open(os.path.join(trakt_friends_dir, filename), 'r') as f:
+                            state = json.load(f)
+                        
+                        # Only include authorized accounts
+                        if state.get('status') == 'authorized':
+                            friends.append({
+                                'auth_id': auth_id,
+                                'friend_name': state.get('friend_name', 'Unknown Friend'),
+                                'username': state.get('username', ''),
+                                'display_name': f"{state.get('friend_name', 'Unknown Friend')}'s Watchlist"
+                            })
+                    except Exception as e:
+                        logging.error(f"Error reading friend state file {filename}: {str(e)}")
+        
+        return jsonify({
+            'success': True,
+            'friends': friends
+        })
+    
+    except Exception as e:
+        logging.error(f"Error listing Trakt friends: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 @settings_bp.route('/content_sources/add', methods=['POST'])
 def add_content_source_route():
@@ -201,7 +251,16 @@ def add_notification():
                 'unreleased': False,
                 'blacklisted': False,
                 'pending_uncached': False,
-                'upgrading': False
+                'upgrading': False,
+                'program_stop': True,
+                'program_crash': True,
+                'program_start': True,
+                'program_pause': True,
+                'program_resume': True,
+                'queue_pause': True,
+                'queue_resume': True,
+                'queue_start': True,
+                'queue_stop': True
             }
         }
 
@@ -252,7 +311,16 @@ def ensure_notification_defaults(notification_config):
         'unreleased': False,
         'blacklisted': False,
         'pending_uncached': False,
-        'upgrading': False
+        'upgrading': False,
+        'program_stop': True,
+        'program_crash': True,
+        'program_start': True,
+        'program_pause': True,
+        'program_resume': True,
+        'queue_pause': True,
+        'queue_resume': True,
+        'queue_start': True,
+        'queue_stop': True
     }
 
     # If notify_on is missing or empty, set it to the default values
@@ -314,6 +382,9 @@ def index():
         scraper_types = list(SETTINGS_SCHEMA["Scrapers"]["schema"].keys())        
         source_types = list(SETTINGS_SCHEMA["Content Sources"]["schema"].keys())        
         scraper_settings = {scraper: list(SETTINGS_SCHEMA["Scrapers"]["schema"][scraper].keys()) for scraper in SETTINGS_SCHEMA["Scrapers"]["schema"]}
+
+        # Check if platform is Windows
+        is_windows = platform.system() == 'Windows'
 
         # Fetch content source settings
         content_source_settings_response = get_content_source_settings_route()
@@ -388,7 +459,8 @@ def index():
                                source_types=source_types,
                                content_source_settings=content_source_settings,
                                scraping_versions=scraping_versions,
-                               settings_schema=SETTINGS_SCHEMA)
+                               settings_schema=SETTINGS_SCHEMA,
+                               is_windows=is_windows)
     except Exception as e:
         current_app.logger.error(f"Error in settings route: {str(e)}")
         current_app.logger.error(traceback.format_exc())
@@ -430,6 +502,27 @@ def update_settings():
     try:
         new_settings = request.json
         config = load_config()
+        
+        logging.info("Received settings update:")
+        logging.info(f"File Management: {json.dumps(new_settings.get('File Management', {}), indent=2)}")
+        logging.info(f"Plex: {json.dumps(new_settings.get('Plex', {}), indent=2)}")
+
+        # Validate Plex libraries if Plex is selected
+        file_management = new_settings.get('File Management', {})
+        if file_management.get('file_collection_management') == 'Plex':
+            plex_settings = new_settings.get('Plex', {})
+            movie_libraries = plex_settings.get('movie_libraries', '').strip()
+            show_libraries = plex_settings.get('shows_libraries', '').strip()
+            
+            logging.info(f"Validating Plex libraries - Movie: '{movie_libraries}', Shows: '{show_libraries}'")
+            
+            if not movie_libraries or not show_libraries:
+                error_msg = "When using Plex as your library management system, you must specify both a movie library and a TV show library."
+                logging.error(f"Settings validation failed: {error_msg}")
+                return jsonify({
+                    "status": "error",
+                    "message": error_msg
+                }), 400
 
         def update_nested_dict(current, new):
             for key, value in new.items():
@@ -568,7 +661,9 @@ def add_version():
         'filter_in': [],
         'filter_out': [],
         'min_size_gb': 0.01,
-        'max_size_gb': ''
+        'max_size_gb': '',
+        'wake_count': None,
+        'require_physical_release': False  # Add default require_physical_release setting
     }
 
     save_config(config)
@@ -590,6 +685,48 @@ def delete_version():
     else:
         return jsonify({'success': False, 'error': 'Version not found'}), 404
 
+@settings_bp.route('/versions/import_defaults', methods=['POST'])
+def import_default_versions():
+    try:
+        # Read the default versions from the JSON file
+        with open('optional_default_versions.json', 'r') as f:
+            default_versions = json.load(f)
+        
+        if not isinstance(default_versions, dict) or 'versions' not in default_versions:
+            return jsonify({'success': False, 'error': 'Invalid default versions format'}), 400
+            
+        # Load current config
+        config = load_config()
+        if 'Scraping' not in config:
+            config['Scraping'] = {}
+        if 'versions' not in config['Scraping']:
+            config['Scraping']['versions'] = {}
+            
+        # Add each default version with a unique name
+        for version_name, version_config in default_versions['versions'].items():
+            base_name = version_name
+            counter = 1
+            new_name = base_name
+            
+            # Find a unique name for this version
+            while new_name in config['Scraping']['versions']:
+                new_name = f"{base_name} {counter}"
+                counter += 1
+                
+            config['Scraping']['versions'][new_name] = version_config
+        
+        # Save the updated config
+        save_config(config)
+        
+        return jsonify({'success': True, 'message': 'Default versions imported successfully'})
+    except FileNotFoundError:
+        return jsonify({'success': False, 'error': 'Default versions file not found'}), 404
+    except json.JSONDecodeError:
+        return jsonify({'success': False, 'error': 'Invalid JSON in default versions file'}), 400
+    except Exception as e:
+        logging.error(f"Error importing default versions: {str(e)}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 @settings_bp.route('/versions/rename', methods=['POST'])
 def rename_version():
     data = request.json
@@ -603,8 +740,15 @@ def rename_version():
     if 'Scraping' in config and 'versions' in config['Scraping']:
         versions = config['Scraping']['versions']
         if old_name in versions:
+            # Update version name in config
             versions[new_name] = versions.pop(old_name)
             save_config(config)
+            
+            # Update version name in database
+            from database.database_writing import update_version_name
+            updated_count = update_version_name(old_name, new_name)
+            logging.info(f"Updated {updated_count} media items in database from version '{old_name}' to '{new_name}'")
+            
             return jsonify({'success': True})
         else:
             return jsonify({'success': False, 'error': 'Version not found'}), 404
@@ -629,7 +773,15 @@ def duplicate_version():
         new_version_id = f"{version_id} Copy {counter}"
         counter += 1
 
-    config['Scraping']['versions'][new_version_id] = config['Scraping']['versions'][version_id].copy()
+    # Create a deep copy of the version settings
+    original_settings = config['Scraping']['versions'][version_id]
+    new_settings = original_settings.copy()
+    
+    # Ensure require_physical_release is included in the copy
+    if 'require_physical_release' not in new_settings:
+        new_settings['require_physical_release'] = False
+
+    config['Scraping']['versions'][new_version_id] = new_settings
     config['Scraping']['versions'][new_version_id]['display_name'] = new_version_id
 
     save_config(config)
@@ -704,13 +856,23 @@ def save_version_settings():
         if 'versions' not in config['Scraping']:
             config['Scraping']['versions'] = {}
         
+        # Handle wake_count conversion
+        if 'wake_count' in settings:
+            if settings['wake_count'] == '' or settings['wake_count'] == 'None' or settings['wake_count'] is None:
+                settings['wake_count'] = None
+            else:
+                try:
+                    settings['wake_count'] = int(settings['wake_count'])
+                except (ValueError, TypeError):
+                    settings['wake_count'] = None
+        
         config['Scraping']['versions'][version] = settings
         save_config(config)
         
         return jsonify({'success': True})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
-    
+
 def update_required_settings(form_data):
     config = load_config()
     config['Plex']['url'] = form_data.get('plex_url')
@@ -845,4 +1007,328 @@ def update_notification_defaults():
         return jsonify({'success': True, 'message': 'Notification defaults updated successfully'})
     except Exception as e:
         logging.error(f"Error updating notification defaults: {str(e)}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@settings_bp.route('/versions/add_default', methods=['POST'])
+def add_default_version():
+    try:
+        config = load_config()
+        if 'Scraping' not in config:
+            config['Scraping'] = {}
+
+        # Get the default version settings from the schema
+        version_schema = SETTINGS_SCHEMA['Scraping']['versions']['schema']
+        default_version = {
+            'enable_hdr': version_schema['enable_hdr']['default'],
+            'max_resolution': version_schema['max_resolution']['default'],
+            'resolution_wanted': version_schema['resolution_wanted']['default'],
+            'resolution_weight': version_schema['resolution_weight']['default'],
+            'hdr_weight': version_schema['hdr_weight']['default'],
+            'similarity_weight': version_schema['similarity_weight']['default'],
+            'similarity_threshold': version_schema['similarity_threshold']['default'],
+            'similarity_threshold_anime': version_schema['similarity_threshold_anime']['default'],
+            'size_weight': version_schema['size_weight']['default'],
+            'bitrate_weight': version_schema['bitrate_weight']['default'],
+            'preferred_filter_in': version_schema['preferred_filter_in']['default'],
+            'preferred_filter_out': version_schema['preferred_filter_out']['default'],
+            'filter_in': version_schema['filter_in']['default'],
+            'filter_out': version_schema['filter_out']['default'],
+            'min_size_gb': version_schema['min_size_gb']['default'],
+            'max_size_gb': version_schema['max_size_gb']['default'],
+            'min_bitrate_mbps': version_schema['min_bitrate_mbps']['default'],
+            'max_bitrate_mbps': version_schema['max_bitrate_mbps']['default'],
+            'wake_count': version_schema['wake_count']['default'],
+            'require_physical_release': version_schema['require_physical_release']['default']
+        }
+
+        # Add the default version while preserving existing versions
+        if 'versions' not in config['Scraping']:
+            config['Scraping']['versions'] = {}
+        
+        # Find a unique name for the default version
+        version_name = 'Default'
+        counter = 1
+        while version_name in config['Scraping']['versions']:
+            version_name = f'Default {counter}'
+            counter += 1
+            
+        config['Scraping']['versions'][version_name] = default_version
+        save_config(config)
+
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@settings_bp.route('/versions/add_separate_versions', methods=['POST'])
+def add_separate_versions():
+    try:
+        config = load_config()
+        if 'Scraping' not in config:
+            config['Scraping'] = {}
+
+        # Get the default version settings from the schema
+        version_schema = SETTINGS_SCHEMA['Scraping']['versions']['schema']
+        base_version = {
+            'resolution_wanted': version_schema['resolution_wanted']['default'],
+            'resolution_weight': version_schema['resolution_weight']['default'],
+            'hdr_weight': version_schema['hdr_weight']['default'],
+            'similarity_weight': version_schema['similarity_weight']['default'],
+            'similarity_threshold': version_schema['similarity_threshold']['default'],
+            'similarity_threshold_anime': version_schema['similarity_threshold_anime']['default'],
+            'size_weight': version_schema['size_weight']['default'],
+            'bitrate_weight': version_schema['bitrate_weight']['default'],
+            'preferred_filter_in': [],
+            'preferred_filter_out': [],
+            'filter_in': [],
+            'filter_out': [],
+            'min_size_gb': version_schema['min_size_gb']['default'],
+            'max_size_gb': version_schema['max_size_gb']['default'],
+            'min_bitrate_mbps': version_schema['min_bitrate_mbps']['default'],
+            'max_bitrate_mbps': version_schema['max_bitrate_mbps']['default'],
+            'wake_count': version_schema['wake_count']['default'],
+            'require_physical_release': version_schema['require_physical_release']['default']
+        }
+
+        # Create 1080p version
+        version_1080p = base_version.copy()
+        version_1080p.update({
+            'enable_hdr': False,
+            'max_resolution': '1080p',
+            'preferred_filter_in': [
+                [
+                    'REMUX',
+                    100
+                ],
+                [
+                    'WebDL',
+                    50
+                ],
+                [
+                    'Web-DL',
+                    50
+                ]
+            ],
+            'preferred_filter_out': [
+                [
+                    '720p',
+                    5
+                ],
+                [
+                    'TrueHD',
+                    3
+                ],
+                [
+                    'SDR',
+                    5
+                ]
+            ],
+            'filter_out': [
+                'Telesync',
+                '3D',
+                '(?i)\\bHDTS\\b',
+                'HD-TS',
+                '\\.TS\\.',
+                '\\.CAM\\.',
+                'HDCAM',
+                'Telecine',
+                '(?i).*\\bTS\\b$'
+            ]
+        })
+
+        # Create 4K version
+        version_4k = base_version.copy()
+        version_4k.update({
+            'enable_hdr': True,
+            'max_resolution': '2160p',
+            'resolution_wanted': '==',
+            'wake_count': 6,
+            'preferred_filter_in': [
+                [
+                    'REMUX',
+                    100
+                ],
+                [
+                    'WebDL',
+                    50
+                ],
+                [
+                    'Web-DL',
+                    50
+                ]
+            ],
+            'preferred_filter_out': [
+                [
+                    '720p',
+                    5
+                ],
+                [
+                    'TrueHD',
+                    3
+                ],
+                [
+                    'SDR',
+                    5
+                ]
+            ],
+            'filter_out': [
+                'Telesync',
+                '3D',
+                '(?i)\\bHDTS\\b',
+                'HD-TS',
+                '\\.TS\\.',
+                '\\.CAM\\.',
+                'HDCAM',
+                'Telecine',
+                '(?i).*\\bTS\\b$'
+            ]
+        })
+
+        # Add the new versions while preserving existing versions
+        if 'versions' not in config['Scraping']:
+            config['Scraping']['versions'] = {}
+        
+        # Find unique names for the versions
+        version_1080p_name = '1080p'
+        version_4k_name = '2160p'
+        counter_1080p = 1
+        counter_4k = 1
+        
+        while version_1080p_name in config['Scraping']['versions']:
+            version_1080p_name = f'1080p {counter_1080p}'
+            counter_1080p += 1
+            
+        while version_4k_name in config['Scraping']['versions']:
+            version_4k_name = f'2160p {counter_4k}'
+            counter_4k += 1
+            
+        # Add the new versions
+        config['Scraping']['versions'][version_1080p_name] = version_1080p
+        config['Scraping']['versions'][version_4k_name] = version_4k
+        save_config(config)
+
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@settings_bp.route('/versions/clear_all', methods=['POST'])
+def clear_all_versions():
+    try:
+        config = load_config()
+        if 'Scraping' in config:
+            config['Scraping']['versions'] = {}
+            save_config(config)
+        return jsonify({'success': True})
+    except Exception as e:
+        logging.error(f"Error clearing versions: {str(e)}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@settings_bp.route('/notifications/test', methods=['POST'])
+def test_notification():
+    try:
+        notification_id = request.json.get('notification_id')
+        if not notification_id:
+            return jsonify({'success': False, 'error': 'No notification ID provided'}), 400
+
+        config = load_config()
+        if 'Notifications' not in config or notification_id not in config['Notifications']:
+            return jsonify({'success': False, 'error': 'Notification not found'}), 404
+
+        notification_config = config['Notifications'][notification_id]
+        
+        # Create a test notification
+        test_notification = {
+            'title': 'Test Notification',
+            'message': f'This is a test notification from {notification_config["title"]}',
+            'type': 'info',
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+        
+        # Get the notification type
+        notification_type = notification_config['type']
+        
+        # Send the test notification based on the type
+        success = False
+        message = "Test notification sent successfully"
+        
+        try:
+            if notification_type == 'Telegram':
+                if not notification_config.get('bot_token') or not notification_config.get('chat_id'):
+                    return jsonify({'success': False, 'error': 'Missing Telegram configuration'}), 400
+                
+                content = f"<b>Test Notification</b>\n\nThis is a test message from CLI Debrid. If you're seeing this, your Telegram notifications are working correctly!"
+                send_telegram_notification(
+                    notification_config['bot_token'],
+                    notification_config['chat_id'],
+                    content
+                )
+                success = True
+                
+            elif notification_type == 'Discord':
+                if not notification_config.get('webhook_url'):
+                    return jsonify({'success': False, 'error': 'Missing Discord webhook URL'}), 400
+                
+                content = "**Test Notification**\n\nThis is a test message from CLI Debrid. If you're seeing this, your Discord notifications are working correctly!"
+                send_discord_notification(
+                    notification_config['webhook_url'],
+                    content
+                )
+                success = True
+                
+            elif notification_type == 'NTFY':
+                if not notification_config.get('host') or not notification_config.get('topic'):
+                    return jsonify({'success': False, 'error': 'Missing NTFY configuration'}), 400
+                
+                content = "Test Notification\n\nThis is a test message from CLI Debrid. If you're seeing this, your NTFY notifications are working correctly!"
+                send_ntfy_notification(
+                    notification_config['host'],
+                    notification_config.get('api_key', ''),
+                    notification_config.get('priority', 'low'),
+                    notification_config['topic'],
+                    content
+                )
+                success = True
+                
+            elif notification_type == 'Email':
+                required_fields = ['smtp_server', 'smtp_port', 'smtp_username', 'smtp_password', 'from_address', 'to_address']
+                missing_fields = [field for field in required_fields if not notification_config.get(field)]
+                
+                if missing_fields:
+                    return jsonify({'success': False, 'error': f'Missing Email configuration: {", ".join(missing_fields)}'}), 400
+                
+                content = """
+                <html>
+                <body>
+                <h2>Test Notification</h2>
+                <p>This is a test message from CLI Debrid. If you're seeing this, your Email notifications are working correctly!</p>
+                </body>
+                </html>
+                """
+                
+                smtp_config = {
+                    'smtp_server': notification_config['smtp_server'],
+                    'smtp_port': notification_config['smtp_port'],
+                    'smtp_username': notification_config['smtp_username'],
+                    'smtp_password': notification_config['smtp_password'],
+                    'from_address': notification_config['from_address'],
+                    'to_address': notification_config['to_address']
+                }
+                
+                send_email_notification(smtp_config, content)
+                success = True
+            
+            else:
+                return jsonify({'success': False, 'error': f'Unknown notification type: {notification_type}'}), 400
+                
+            if success:
+                logging.info(f"Test notification sent successfully for {notification_id}")
+                return jsonify({'success': True, 'message': message})
+            else:
+                return jsonify({'success': False, 'error': 'Failed to send test notification'}), 500
+                
+        except Exception as e:
+            logging.error(f"Error sending test notification: {str(e)}", exc_info=True)
+            return jsonify({'success': False, 'error': f'Error sending test notification: {str(e)}'}), 500
+            
+    except Exception as e:
+        logging.error(f"Error testing notification: {str(e)}", exc_info=True)
         return jsonify({'success': False, 'error': str(e)}), 500

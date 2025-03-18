@@ -1,5 +1,5 @@
 from flask import jsonify, request, current_app, Blueprint, logging, render_template
-from routes import admin_required
+from routes import admin_required, user_required
 from .database_routes import perform_database_migration 
 from extensions import initialize_app 
 from config_manager import load_config 
@@ -18,6 +18,11 @@ import signal
 import psutil
 import sys
 import subprocess
+import xml.etree.ElementTree as ET
+from notifications import (
+    send_queue_start_notification,
+    send_queue_stop_notification
+)
 
 program_operation_bp = Blueprint('program_operation', __name__)
 
@@ -247,15 +252,145 @@ def check_service_connectivity():
     debrid_api_key = get_setting('Debrid Provider', 'api_key')
 
     services_reachable = True
+    failed_services = []
 
-    # Check Plex connectivity
+    # Check Symlink paths if using symlink management
+    if get_setting('File Management', 'file_collection_management') == 'Symlinked/Local':
+        original_path = get_setting('File Management', 'original_files_path')
+        symlinked_path = get_setting('File Management', 'symlinked_files_path')
+        
+        # Check original files path
+        if not os.path.exists(original_path):
+            logging.error(f"Cannot access original files path: {original_path}")
+            services_reachable = False
+            failed_services.append(f"Original files path ({original_path})")
+        elif not os.listdir(original_path):
+            logging.warning(f"Original files path is empty: {original_path}")
+            
+        # Check symlinked files path
+        if not os.path.exists(symlinked_path):
+            try:
+                os.makedirs(symlinked_path, exist_ok=True)
+                logging.info(f"Created symlinked files path: {symlinked_path}")
+            except Exception as e:
+                logging.error(f"Cannot create symlinked files path: {symlinked_path}. Error: {str(e)}")
+                services_reachable = False
+                failed_services.append(f"Symlinked files path ({symlinked_path})")
+                
+        # Check Plex connectivity for symlink updates if enabled
+        plex_url_symlink = get_setting('File Management', 'plex_url_for_symlink')
+        plex_token_symlink = get_setting('File Management', 'plex_token_for_symlink')
+        
+        if plex_url_symlink and plex_token_symlink:
+            try:
+                response = api.get(f"{plex_url_symlink}?X-Plex-Token={plex_token_symlink}", timeout=5)
+                response.raise_for_status()
+                
+                # Verify we got a valid Plex response by checking for required attributes
+                root = ET.fromstring(response.text)
+                if not root.get('machineIdentifier') or not root.get('myPlexSigninState'):
+                    error_msg = "Invalid Plex response for symlink updates - token may be incorrect"
+                    logging.error(error_msg)
+                    services_reachable = False
+                    failed_services.append("Plex (for symlink updates)")
+                else:
+                    services_reachable = True  # Set to True when Plex is reachable
+                    logging.debug("Plex connectivity check passed")
+            except (RequestException, ET.ParseError) as e:
+                error_msg = f"Cannot connect to Plex server for symlink updates. Error: {str(e)}"
+                logging.error(error_msg)
+                services_reachable = False
+                failed_services.append("Plex (for symlink updates)")
+
+    # Check Plex connectivity and libraries
     if get_setting('File Management', 'file_collection_management') == 'Plex':
         try:
+            # First check basic connectivity and token validity
             response = api.get(f"{plex_url}?X-Plex-Token={plex_token}", timeout=5)
             response.raise_for_status()
+            
+            # Verify we got a valid Plex response by checking for required attributes
+            try:
+                root = ET.fromstring(response.text)
+                if not root.get('machineIdentifier') or not root.get('myPlexSigninState'):
+                    error_msg = "Invalid Plex response - token may be incorrect"
+                    logging.error(error_msg)
+                    services_reachable = False
+                    failed_services.append("Plex (invalid token)")
+                    return services_reachable, failed_services
+                else:
+                    logging.info(f"Successfully validated Plex connection (Server: {root.get('friendlyName', 'Unknown')})")
+            except ET.ParseError as e:
+                error_msg = f"Invalid Plex response format: {str(e)}"
+                logging.error(error_msg)
+                services_reachable = False
+                failed_services.append("Plex (invalid response format)")
+                return services_reachable, failed_services
+
+            # Then check library existence
+            libraries_response = api.get(f"{plex_url}/library/sections?X-Plex-Token={plex_token}", timeout=5)
+            libraries_response.raise_for_status()
+            
+            # Get configured library names
+            movie_libraries = [lib.strip() for lib in get_setting('Plex', 'movie_libraries', '').split(',') if lib.strip()]
+            show_libraries = [lib.strip() for lib in get_setting('Plex', 'shows_libraries', '').split(',') if lib.strip()]
+            
+            try:
+                # Get actual library names from Plex (XML format)
+                available_libraries = []
+                library_id_to_title = {}  # Map to store ID -> Title mapping
+                root = ET.fromstring(libraries_response.text)
+                for directory in root.findall('.//Directory'):
+                    library_title = directory.get('title')
+                    library_key = directory.get('key')
+                    if library_title and library_key:
+                        available_libraries.append(library_title)
+                        library_id_to_title[library_key] = library_title
+                        logging.info(f"Found Plex library: ID={library_key}, Title='{library_title}', Type={directory.get('type')}")
+                
+                if not available_libraries:
+                    logging.error("No libraries found in Plex response")
+                    services_reachable = False
+                    failed_services.append("Plex (no libraries found)")
+                    return services_reachable, failed_services
+
+                # Verify all configured libraries exist (check both IDs and names)
+                missing_libraries = []
+                for lib in movie_libraries + show_libraries:
+                    # Check if the library exists either as a title or an ID
+                    if lib not in available_libraries and lib not in library_id_to_title:
+                        # If it's a number, try to show the expected title
+                        if lib.isdigit() and lib in library_id_to_title:
+                            logging.info(f"Library ID {lib} refers to library '{library_id_to_title[lib]}'")
+                        else:
+                            missing_libraries.append(lib)
+                            logging.warning(f"Library '{lib}' not found in available libraries")
+
+                if missing_libraries:
+                    error_msg = "Cannot start program: The following Plex libraries were not found:<ul>"
+                    for lib in missing_libraries:
+                        error_msg += f"<li>{lib}</li>"
+                    error_msg += "</ul>Available libraries are:<ul>"
+                    for title in available_libraries:
+                        error_msg += f"<li>{title}</li>"
+                    error_msg += "</ul>Please verify your Plex library names in settings."
+                    logging.error(error_msg)
+                    services_reachable = False
+                    failed_services.append(f"Plex (missing libraries: {', '.join(missing_libraries)})")
+                    return services_reachable, failed_services
+
+            except ET.ParseError as e:
+                error_msg = f"Failed to parse Plex libraries response (XML): {str(e)}"
+                logging.error(error_msg)
+                services_reachable = False
+                failed_services.append("Plex (invalid libraries response)")
+                return services_reachable, failed_services
+
         except RequestException as e:
-            logging.error(f"Failed to connect to Plex server: {str(e)}")
+            error_msg = f"Cannot start program: Failed to connect to Plex server. Error: {str(e)}"
+            logging.error(error_msg)
             services_reachable = False
+            failed_services.append("Plex (connection error)")
 
     # Check Debrid Provider connectivity
     if debrid_provider.lower() == 'realdebrid':
@@ -265,16 +400,11 @@ def check_service_connectivity():
         except RequestException as e:
             logging.error(f"Failed to connect to Real-Debrid API: {str(e)}")
             services_reachable = False
-    elif debrid_provider.lower() == 'torbox':
-        try:
-            response = api.get("https://torbox.app/api/v1/user", headers={"Authorization": f"Bearer {debrid_api_key}"}, timeout=5)
-            response.raise_for_status()
-        except RequestException as e:
-            logging.error(f"Failed to connect to Torbox API: {str(e)}")
-            services_reachable = False
+            failed_services.append("Real-Debrid API")
     else:
         logging.error(f"Unknown debrid provider: {debrid_provider}")
         services_reachable = False
+        failed_services.append(f"Unknown debrid provider ({debrid_provider})")
 
     # Check Metadata Battery connectivity and Trakt authorization
     try:
@@ -289,6 +419,7 @@ def check_service_connectivity():
         if trakt_status != 'authorized':
             logging.warning("Metadata Battery is reachable, but Trakt is not authorized.")
             services_reachable = False
+            failed_services.append("Trakt (not authorized)")
     except RequestException as e:
         if hasattr(e, 'response') and e.response is not None:
             logging.error(f"Failed to connect to Metadata Battery: {e.response.status_code} {e.response.reason}")
@@ -296,8 +427,9 @@ def check_service_connectivity():
         else:
             logging.error(f"Failed to connect to Metadata Battery: {str(e)}")
         services_reachable = False
+        failed_services.append("Metadata Battery")
 
-    return services_reachable
+    return services_reachable, failed_services
 
 @program_operation_bp.route('/api/start_program', methods=['POST'])
 def start_program():
@@ -313,28 +445,41 @@ def start_program():
         time.sleep(1)  # 1 second delay for auto-start
 
     # Check service connectivity before starting the program
-    if not check_service_connectivity():
-        return jsonify({"status": "error", "message": "Failed to connect to Plex, Debrid Provider, or Metadata Battery. Check logs for details."})
+    check_result, failed_services = check_service_connectivity()
+    if not check_result:
+        # Get the last error message from the logs
+        error_message = "Failed to connect to required services. Check the logs for details."
+        for handler in logging.getLogger().handlers:
+            if isinstance(handler, logging.StreamHandler):
+                try:
+                    # Get the last error message if available
+                    error_message = handler.stream.getvalue().strip().split('\n')[-1]
+                except:
+                    pass
+        return jsonify({"status": "error", "message": error_message, "failed_services": failed_services})
 
     program_runner = ProgramRunner()
     # Start the program runner in a separate thread to avoid blocking the Flask server
     threading.Thread(target=program_runner.start).start()
     current_app.config['PROGRAM_RUNNING'] = True
+    
+    # Send program start notification
+    send_queue_start_notification("Queue processing started via web interface")
+    
     return jsonify({"status": "success", "message": "Program started"})
 
 def stop_program():
     global program_runner, server_thread
     try:
         if program_runner is not None and program_runner.is_running():
+            # Send stop notification before stopping
+            send_queue_stop_notification("Queue processing stopped via web interface")
+            
             program_runner.stop()
             # Invalidate content sources cache before nulling the instance
             program_runner.invalidate_content_sources_cache()
             program_runner = None
             
-        # Cleanup port
-        # port = int(os.environ.get('CLI_DEBRID_PORT', 5000))
-        # cleanup_port(port)
-        
         current_app.config['PROGRAM_RUNNING'] = False
         return {"status": "success", "message": "Program stopped"}
     except Exception as e:
@@ -403,7 +548,7 @@ def check_program_conditions():
     })
 
 @program_operation_bp.route('/api/task_timings', methods=['GET'])
-@login_required
+@user_required
 def get_task_timings():
     global program_runner
     
@@ -413,6 +558,9 @@ def get_task_timings():
             "current_task": None,
             "tasks": []
         })
+
+    # Ensure content sources are loaded
+    program_runner.get_content_sources()
 
     current_time = time.time()
     task_timings = {}
@@ -453,6 +601,11 @@ def get_task_timings():
             grouped_timings["content_sources"][task] = timing
         else:
             grouped_timings["system_tasks"][task] = timing
+    
+    # Log content source tasks for debugging
+    content_source_tasks = [task for task in task_timings.keys() if task.endswith('_wanted')]
+    logging.debug(f"Content source tasks: {content_source_tasks}")
+    logging.debug(f"Content sources in grouped_timings: {list(grouped_timings['content_sources'].keys())}")
 
     return jsonify({
         "success": True,
@@ -461,7 +614,111 @@ def get_task_timings():
     })
 
 @program_operation_bp.route('/task_timings')
-@login_required
-@admin_required
+@user_required
 def task_timings():
     return render_template('task_timings.html')
+
+@program_operation_bp.route('/trigger_task', methods=['POST'])
+@admin_required
+def trigger_task():
+    task_name = request.form.get('task_name')
+    if not task_name:
+        return jsonify({'success': False, 'error': 'Task name is required'})
+    
+    try:
+        program_runner = get_program_runner()
+        if not program_runner:
+            return jsonify({'success': False, 'error': 'Program is not running'})
+        
+        program_runner.trigger_task(task_name)
+        return jsonify({'success': True, 'message': f'Successfully triggered task: {task_name}'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+@program_operation_bp.route('/enable_task', methods=['POST'])
+@admin_required
+def enable_task():
+    task_name = request.form.get('task_name')
+    if not task_name:
+        return jsonify({'success': False, 'error': 'Task name is required'})
+    
+    try:
+        program_runner = get_program_runner()
+        if not program_runner:
+            return jsonify({'success': False, 'error': 'Program is not running'})
+        
+        program_runner.enable_task(task_name)
+        return jsonify({'success': True, 'message': f'Successfully enabled task: {task_name}'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+@program_operation_bp.route('/disable_task', methods=['POST'])
+@admin_required
+def disable_task():
+    task_name = request.form.get('task_name')
+    if not task_name:
+        return jsonify({'success': False, 'error': 'Task name is required'})
+    
+    try:
+        program_runner = get_program_runner()
+        if not program_runner:
+            return jsonify({'success': False, 'error': 'Program is not running'})
+        
+        program_runner.disable_task(task_name)
+        return jsonify({'success': True, 'message': f'Successfully disabled task: {task_name}'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+@program_operation_bp.route('/save_task_toggles', methods=['POST'])
+@admin_required
+def save_task_toggles():
+    """Save the current state of task toggles to a JSON file."""
+    try:
+        import os
+        import json
+        
+        # Get task states from request
+        data = request.json
+        if not data or 'task_states' not in data:
+            return jsonify({'success': False, 'error': 'No task states provided'})
+        
+        task_states = data['task_states']
+        
+        # Get the user_db_content directory from environment variable
+        db_content_dir = os.environ.get('USER_DB_CONTENT', '/user/db_content')
+        toggles_file_path = os.path.join(db_content_dir, 'task_toggles.json')
+        
+        # Save to JSON file
+        with open(toggles_file_path, 'w') as f:
+            json.dump(task_states, f, indent=4)
+        
+        logging.info(f"Task toggle states saved to {toggles_file_path}")
+        return jsonify({'success': True, 'message': 'Task toggle states saved successfully'})
+    except Exception as e:
+        logging.error(f"Error saving task toggles: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)})
+
+@program_operation_bp.route('/load_task_toggles', methods=['GET'])
+@admin_required
+def load_task_toggles():
+    """Load saved task toggle states from a JSON file."""
+    try:
+        import os
+        import json
+        
+        # Get the user_db_content directory from environment variable
+        db_content_dir = os.environ.get('USER_DB_CONTENT', '/user/db_content')
+        toggles_file_path = os.path.join(db_content_dir, 'task_toggles.json')
+        
+        # Check if file exists
+        if not os.path.exists(toggles_file_path):
+            return jsonify({'success': True, 'task_states': {}})
+        
+        # Load from JSON file
+        with open(toggles_file_path, 'r') as f:
+            saved_states = json.load(f)
+        
+        return jsonify({'success': True, 'task_states': saved_states})
+    except Exception as e:
+        logging.error(f"Error loading task toggles: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)})

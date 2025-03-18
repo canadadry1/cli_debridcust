@@ -6,24 +6,32 @@ from settings import get_all_settings, get_setting
 
 # Progress ranges for each phase
 PROGRESS_RANGES = {
-    'reset': (0, 5),    # 5 seconds
-    'plex': (5, 50),    # 2 minutes
-    'sources': (50, 90), # 2 minutes
-    'release': (90, 100) # 30 seconds
+    'reset': (0, 5),     # 5 seconds
+    'plex': (5, 40),     # 2 minutes
+    'sources': (40, 70), # 2 minutes
+    'release': (70, 85), # 30 seconds
+    'show_ids': (85, 92),   # 1 minute
+    'show_titles': (92, 99), # 1 minute
+    'movie_ids': (99, 100), # 1 minute
+    'movie_titles': (100, 100) # 1 minute
 }
 
 # Duration for each phase in seconds
 PHASE_DURATIONS = {
     'reset': 5,
-    'plex': 120,  # 2 minutes
-    'sources': 120,  # 2 minutes
-    'release': 30
+    'plex': 120,    # 2 minutes
+    'sources': 120, # 2 minutes
+    'release': 30,  # 30 seconds
+    'show_ids': 60,    # 1 minute
+    'show_titles': 60,  # 1 minute
+    'movie_ids': 60,    # 1 minute
+    'movie_titles': 60  # 1 minute
 }
 
 # Global variable to track initialization progress
 initialization_status = {
     'current_step': '',
-    'total_steps': 4,
+    'total_steps': 10,
     'current_step_number': 0,
     'progress_value': 0,  # Current progress percentage
     'substep_details': '',
@@ -114,9 +122,20 @@ def reset_queued_item_status():
 def plex_collection_update(skip_initial_plex_update):
     from run_program import get_and_add_all_collected_from_plex, get_and_add_recent_collected_from_plex
     from database import get_all_media_items
+    from utilities.plex_watch_history_functions import sync_get_watch_history_from_plex
+    from settings import get_setting
 
     update_initialization_step("Plex Update", "Starting Plex scan")
     logging.info("Updating Plex collection...")
+
+    # Check if we should pull watch history
+    if get_setting('Debug', 'do_not_add_plex_watch_history_items_to_queue', False):
+        update_initialization_step("Pulling Plex Watch History", "Retrieving watch history from Plex", is_substep=True)
+        try:
+            sync_get_watch_history_from_plex()
+            logging.info("Successfully retrieved Plex watch history")
+        except Exception as e:
+            logging.error(f"Error retrieving Plex watch history: {str(e)}")
 
     try:
         update_initialization_step("Plex Update", 
@@ -199,7 +218,7 @@ def initialize(skip_initial_plex_update=False):
     reset_queued_item_status()
     complete_phase('reset')
        
-    if get_setting('File Management ', 'file_collection_management') == 'Plex':
+    if get_setting('File Management', 'file_collection_management') == 'Plex':
         # Plex Update Phase (2 minutes)
         start_phase('plex', 'Plex Update', 'Starting Plex scan')
         plex_success, should_process_sources = plex_collection_update(skip_initial_plex_update)
@@ -223,6 +242,26 @@ def initialize(skip_initial_plex_update=False):
     refresh_release_dates()
     complete_phase('release')
     
+    from database.maintenance import update_show_ids, update_show_titles, update_movie_ids, update_movie_titles
+
+    # Update Show IDs and Titles (1 minute)
+    start_phase('show_ids', 'Update Show IDs', 'Updating show IDs')
+    update_show_ids()
+    complete_phase('show_ids')
+
+    start_phase('show_titles', 'Update Show Titles', 'Updating show titles')
+    update_show_titles()
+    complete_phase('show_titles')
+
+    # Update Movie IDs and Titles (1 minute)
+    start_phase('movie_ids', 'Update Movie IDs', 'Updating movie IDs')
+    update_movie_ids()
+    complete_phase('movie_ids')
+
+    start_phase('movie_titles', 'Update Movie Titles', 'Updating movie titles')
+    update_movie_titles()
+    complete_phase('movie_titles')
+
     # Complete
     final_status = "completed successfully" if plex_success else "completed with Plex update issues"
     update_initialization_step("Complete", final_status)

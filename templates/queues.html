@@ -184,6 +184,72 @@
         margin: 0 10px;
         align-self: center;
     }
+
+    .show-more-container {
+        text-align: center;
+        margin-top: 15px;
+        padding: 10px;
+    }
+
+    .show-more-container button {
+        background-color: #444;
+        border: none;
+        padding: 5px 15px;
+        border-radius: 4px;
+        color: #fff;
+        cursor: pointer;
+        transition: background-color 0.3s;
+    }
+
+    .show-more-container button:hover {
+        background-color: #555;
+    }
+
+    .hidden-items-summary {
+        margin-top: 20px;
+        padding: 15px;
+        background: #444;
+        border-radius: 5px;
+    }
+
+    .hidden-items-summary h5 {
+        color: #aaa;
+        margin-bottom: 15px;
+        border-bottom: 1px solid #666;
+        padding-bottom: 5px;
+    }
+
+    .hidden-items-summary ul {
+        list-style: none;
+        padding-left: 0;
+        margin-bottom: 0;
+    }
+
+    .hidden-items-summary li {
+        color: #ddd;
+        margin: 5px 0;
+    }
+
+    .parse-error {
+        font-family: monospace;
+        white-space: pre-wrap;
+        word-break: break-word;
+    }
+    
+    .error-details {
+        margin-top: 10px;
+        padding: 10px;
+        background: #2d2d2d;
+        border-radius: 4px;
+    }
+    
+    .error-details pre {
+        margin: 10px 0;
+        padding: 10px;
+        background: #1d1d1d;
+        border-radius: 4px;
+        overflow-x: auto;
+    }
 </style>
 
 <script>
@@ -225,7 +291,10 @@
                     year: item.year,
                     versions: new Set(),
                     seasons: new Set(),
-                    release_date: item.release_date
+                    release_date: item.release_date,
+                    physical_release_date: item.physical_release_date,
+                    scraping_versions: item.scraping_versions,
+                    version: item.version
                 };
             }
             consolidatedItems[key].versions.add(item.version);
@@ -234,13 +303,60 @@
             }
         });
 
-        return Object.values(consolidatedItems).map(item => `
-            <div class="item">
-                ${item.title} (${item.year}) - Version(s): ${Array.from(item.versions).join(', ')}
-                ${item.seasons.size > 0 ? ` - Season(s): ${Array.from(item.seasons).join(', ')}` : ''}
-                ${queueName === 'Unreleased' ? ` - Release Date: ${item.release_date}` : ''}
-            </div>
-        `).join('');
+        return Object.values(consolidatedItems).map(item => {
+            let releaseInfo = item.release_date;
+            
+            // Check if version requires physical release
+            const scraping_versions = item.scraping_versions || {};
+            const version_settings = scraping_versions[item.version] || {};
+            const require_physical = version_settings.require_physical_release || false;
+            
+            if (require_physical) {
+                releaseInfo += ` <span class="physical-release">(Physical: ${item.physical_release_date || 'Unknown'})</span>`;
+            }
+            
+            return `
+                <div class="item">
+                    ${item.title} (${item.year}) - Version(s): ${Array.from(item.versions).join(', ')}
+                    ${item.seasons.size > 0 ? ` - Season(s): ${Array.from(item.seasons).join(', ')}` : ''}
+                    ${queueName === 'Unreleased' ? ` - Release Date: ${releaseInfo}` : ''}
+                </div>
+            `;
+        }).join('');
+    }
+
+    function generateQueueContent(queueName, items) {
+        if (queueName === 'Blacklisted' || queueName === 'Unreleased') {
+            return items.map(item => {
+                let releaseInfo = item.release_date;
+                if (releaseInfo === null || releaseInfo === 'null' || releaseInfo === '') {
+                    releaseInfo = 'Unknown';
+                }
+                
+                // Check if version requires physical release
+                const scraping_versions = item.scraping_versions || {};
+                const version_settings = scraping_versions[item.version] || {};
+                const require_physical = version_settings.require_physical_release || false;
+                
+                if (require_physical) {
+                    let physicalDate = item.physical_release_date;
+                    if (physicalDate === null || physicalDate === 'null' || physicalDate === '') {
+                        physicalDate = 'Unknown';
+                    }
+                    releaseInfo += ` <span class="physical-release">(Physical: ${physicalDate})</span>`;
+                }
+                
+                return `
+                    <div class="item">
+                        ${item.title} (${item.year}) - Version(s): ${item.versions.join(', ')}
+                        ${item.seasons.length > 0 ? ` - Season(s): ${item.seasons.join(', ')}` : ''}
+                        ${queueName === 'Unreleased' ? ` - Release Date: ${releaseInfo}` : ''}
+                    </div>
+                `;
+            }).join('');
+        } else {
+            return generateRegularItems(queueName, items);
+        }
     }
 
     function generateRegularItems(queueName, items) {
@@ -308,9 +424,30 @@
                 seasonEpisode = ` S${season}E${episode}`;
             }
 
+            let releaseInfo = '';
+            // Check if version requires physical release
+            const scraping_versions = item.scraping_versions || {};
+            const version_settings = scraping_versions[item.version] || {};
+            const require_physical = version_settings.require_physical_release || false;
+            
+            let releaseDate = item.release_date;
+            if (releaseDate === null || releaseDate === 'null' || releaseDate === '') {
+                releaseDate = 'Unknown';
+            }
+            
+            if (require_physical) {
+                let physicalDate = item.physical_release_date;
+                if (physicalDate === null || physicalDate === 'null' || physicalDate === '') {
+                    physicalDate = 'Unknown';
+                }
+                releaseInfo = ` - Release Date: ${releaseDate} <span class="physical-release">(Physical: ${physicalDate})</span>`;
+            } else if (releaseDate) {
+                releaseInfo = ` - Release Date: ${releaseDate}`;
+            }
+
             let itemContent = `
                 <div class="item">
-                    ${item.title || 'Unknown Title'} (${item.year || 'Unknown Year'})${seasonEpisode} - Version: ${item.version || 'Unknown'}
+                    ${item.title || 'Unknown Title'} (${item.year || 'Unknown Year'})${seasonEpisode} - Version: ${item.version || 'Unknown'}${releaseInfo}
             `;
 
             if (queueName === 'Checking' && item.filled_by_file) {
@@ -320,12 +457,9 @@
             if (queueName === 'Upgrading') {
                 let formattedTime = 'N/A';
                 if (item.time_added) {
-                    // Convert the timestamp to a Date object and format it
                     formattedTime = new Date(item.time_added).toLocaleString();
                 }
-                itemContent += `
-                    - Time Added: ${formattedTime}
-                `;
+                itemContent += ` - Time Added: ${formattedTime}`;
             }
 
             if (queueName === 'Pending Uncached') {
@@ -337,9 +471,7 @@
             }
 
             if (queueName === 'Sleeping') {
-                itemContent += `
-                    - Wake Count: ${item.wake_count !== undefined ? item.wake_count : 'N/A'}
-                `;
+                itemContent += ` - Wake Count: ${item.wake_count !== undefined ? item.wake_count : 'N/A'}`;
             }
 
             if (queueName === 'Wanted' && item.formatted_scrape_time) {
@@ -439,20 +571,6 @@
             initStatus.classList.add('alert-info');
         }
     }
-
-    function generateQueueContent(queueName, items) {
-        if (queueName === 'Blacklisted' || queueName === 'Unreleased') {
-            return items.map(item => `
-                <div class="item">
-                    ${item.title} (${item.year}) - Version(s): ${item.versions.join(', ')}
-                    ${item.seasons.length > 0 ? ` - Season(s): ${item.seasons.join(', ')}` : ''}
-                    ${queueName === 'Unreleased' ? ` - Release Date: ${item.release_date}` : ''}
-                </div>
-            `).join('');
-        } else {
-            return generateRegularItems(queueName, items);
-        }
-    }
     
     function setupQueueStream() {
         if (eventSource) {
@@ -464,7 +582,7 @@
         const queueContents = document.getElementById('queue-contents');
         const initializationStatus = document.getElementById('initialization-status');
         
-        eventSource.onmessage = (event) => {
+        eventSource.onmessage = function(event) {
             try {
                 const data = JSON.parse(event.data);
                 
@@ -496,11 +614,14 @@
                                 queueDiv.setAttribute('data-queue-name', queueName);
                                 let isExpanded = localStorage.getItem('queue_' + queueName) === 'expanded';
                                 
+                                const totalItems = data.queue_counts[queueName];
+                                const hiddenItems = data.hidden_counts[queueName] || 0;
+                                
                                 queueDiv.innerHTML = `
                                     <div class="queue-title" onclick="toggleQueue(this)">
                                         <span>${queueName}</span>
                                         ${queueName === 'Checking' ? `<span class="filename-toggle ${filenameToggleState ? 'active' : ''}" onclick="toggleFilenames(event)"><i class="fas fa-file"></i></span>` : ''}
-                                        <span class="queue-count">${data.queue_counts ? data.queue_counts[queueName] : data.contents[queueName].length} items</span>
+                                        <span class="queue-count">${totalItems} items</span>
                                     </div>
                                     <div class="queue-items" style="display: ${isExpanded ? 'block' : 'none'};">
                                         ${generateQueueContent(queueName, data.contents[queueName])}
@@ -511,7 +632,23 @@
                         });
 
                         if (!hasContent) {
-                            queueContents.innerHTML = '<p>Program is currently idle.</p>';
+                            queueContents.innerHTML = '<p>Program is running, but no active contents in queues.</p>';
+                        } else {
+                            // Add summary of hidden items if any
+                            const hiddenCounts = data.hidden_counts;
+                            if (Object.keys(hiddenCounts).length > 0) {
+                                let hiddenSummary = document.createElement('div');
+                                hiddenSummary.className = 'hidden-items-summary';
+                                let summaryText = '<h5>Additional Items Not Shown:</h5><ul>';
+                                for (const [queueName, count] of Object.entries(hiddenCounts)) {
+                                    if (count > 0) {
+                                        summaryText += `<li>${queueName}: ${count} items</li>`;
+                                    }
+                                }
+                                summaryText += '</ul>';
+                                hiddenSummary.innerHTML = summaryText;
+                                queueContents.appendChild(hiddenSummary);
+                            }
                         }
                         
                         updateFilenameVisibility();
@@ -522,21 +659,83 @@
                     queueContents.style.display = 'block';
                     queueContents.innerHTML = '<p>Program is not running, or queues are empty.</p>';
                 }
-            } catch (error) {
-                console.error('Error parsing queue data:', error);
-                if (!hasReceivedFirstResponse) {
-                    loadingIndicator.innerHTML = '<p class="text-danger">Error loading queue data. Please refresh the page.</p>';
+            } catch (e) {
+                console.error('Error parsing queue data:', e);
+                console.error('Raw data causing error:', event.data);
+                
+                // Create a more detailed error message
+                let errorDetails = '';
+                try {
+                    // Try to identify the problematic character
+                    const errorPosition = parseInt(e.message.match(/column (\d+)/)?.[1]);
+                    if (!isNaN(errorPosition)) {
+                        const start = Math.max(0, errorPosition - 50);
+                        const end = Math.min(event.data.length, errorPosition + 50);
+                        const snippet = event.data.substring(start, end);
+                        errorDetails = `
+                            <div class="error-details">
+                                <p>Error Position: ${errorPosition}</p>
+                                <p>Data snippet around error (± 50 chars):</p>
+                                <pre>${escapeHtml(snippet)}</pre>
+                                <p>Character at error position: "${escapeHtml(event.data[errorPosition-1] || '')}"</p>
+                            </div>
+                        `;
+                    }
+                } catch (detailError) {
+                    errorDetails = '<p>Could not extract detailed error information</p>';
                 }
+                
+                // Show error in UI
+                showError(`
+                    <div class="parse-error">
+                        <h4>JSON Parse Error</h4>
+                        <p>${e.message}</p>
+                        ${errorDetails}
+                    </div>
+                `);
             }
         };
 
-        eventSource.onerror = (error) => {
+        eventSource.onerror = function(error) {
             console.error('EventSource failed:', error);
             if (!hasReceivedFirstResponse) {
                 loadingIndicator.innerHTML = '<p class="text-danger">Connection lost. Reconnecting...</p>';
             }
             // EventSource will automatically try to reconnect
         };
+    }
+
+    function showError(message) {
+        const errorDiv = document.createElement('div');
+        errorDiv.className = 'alert alert-danger';
+        errorDiv.innerHTML = message;
+        
+        // Remove any existing error messages
+        const existingErrors = document.querySelectorAll('.alert-danger');
+        existingErrors.forEach(el => el.remove());
+        
+        // Insert the new error at the top of the container
+        const container = document.querySelector('.container');
+        container.insertBefore(errorDiv, container.firstChild);
+    }
+
+    function escapeHtml(unsafe) {
+        return unsafe
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#039;");
+    }
+
+    function increasePageSize() {
+        // Get current page size
+        let currentPageSize = parseInt(localStorage.getItem('queue_page_size')) || 50;
+        // Increase by 50, up to max of 100
+        const newPageSize = Math.min(currentPageSize + 50, 100);
+        localStorage.setItem('queue_page_size', newPageSize);
+        // Restart the event stream with new page size
+        setupQueueStream();
     }
 
     // Initial setup

@@ -8,18 +8,29 @@ import re
 from datetime import datetime
 import time
 from utilities.anidb_functions import format_filename_with_anidb
+from database.database_writing import update_media_item_state, update_media_item
+from utilities.post_processing import handle_state_change
+from database import get_media_item_by_id
 
 def sanitize_filename(filename: str) -> str:
     """Sanitize filename to be safe for symlinks."""
-    # Only replace characters that are truly problematic for symlinks
-    filename = re.sub(r'[<>|?*]', '_', filename)  # Removed :"/\ from the list as they're valid in paths
+    # Convert Unicode characters to their ASCII equivalents where possible
+    import unicodedata
+    filename = unicodedata.normalize('NFKD', filename).encode('ascii', 'ignore').decode('ascii')
+    
+    # Replace problematic characters
+    filename = re.sub(r'[<>|?*:"\'\&/\\]', '_', filename)  # Added slashes and backslashes
     return filename.strip()  # Just trim whitespace, don't mess with dots
 
 def get_symlink_path(item: Dict[str, Any], original_file: str) -> str:
     """Get the full path for the symlink based on settings and metadata."""
     try:
+        logging.debug(f"get_symlink_path received item with filename_real_path: {item.get('filename_real_path')}")
+        logging.debug(f"Input item: type={item.get('type')}, genres={item.get('genres')}")
+        
         symlinked_path = get_setting('File Management', 'symlinked_files_path')
         organize_by_type = get_setting('File Management', 'symlink_organize_by_type', True)
+        logging.debug(f"Settings: symlinked_path={symlinked_path}, enable_separate_anime_folders={get_setting('Debug', 'enable_separate_anime_folders', False)}")
         
         # Get the original extension
         _, extension = os.path.splitext(original_file)
@@ -28,9 +39,60 @@ def get_symlink_path(item: Dict[str, Any], original_file: str) -> str:
         parts = []
         media_type = item.get('type', 'movie')
         
-        # Add Movies/TV Shows root folder if enabled
-        if organize_by_type:
-            parts.append('Movies' if media_type == 'movie' else 'TV Shows')
+        # Check if this is an anime
+        genres = item.get('genres', '') or ''
+        # Handle both string and list formats of genres
+        if isinstance(genres, str):
+            try:
+                # Try to parse as JSON first (for database-stored genres)
+                import json
+                genres = json.loads(genres)
+            except json.JSONDecodeError:
+                # If not JSON, split by comma (for comma-separated strings)
+                genres = [g.strip() for g in genres.split(',') if g.strip()]
+        # Ensure genres is a list
+        if not isinstance(genres, list):
+            genres = [str(genres)]
+        # Check for anime in any genre
+        is_anime = any('anime' in genre.lower() for genre in genres)
+        logging.debug(f"Content type: {'Anime' if is_anime else 'Regular'} {media_type}")
+        
+        # Determine the appropriate root folder
+        # If it's anime and we have separate folders enabled, use anime folders
+        if is_anime and get_setting('Debug', 'enable_separate_anime_folders', False):
+            if media_type == 'movie':
+                folder_name = get_setting('Debug', 'anime_movies_folder_name', 'Anime Movies')
+                logging.debug(f"Using anime movies folder name: {folder_name}")
+            else:
+                folder_name = get_setting('Debug', 'anime_tv_shows_folder_name', 'Anime TV Shows')
+                logging.debug(f"Using anime TV shows folder name: {folder_name}")
+        # Otherwise use regular folders
+        else:
+            if media_type == 'movie':
+                folder_name = get_setting('Debug', 'movies_folder_name', 'Movies')
+                logging.debug(f"Using movies folder name: {folder_name}")
+            else:
+                folder_name = get_setting('Debug', 'tv_shows_folder_name', 'TV Shows')
+                logging.debug(f"Using TV shows folder name: {folder_name}")
+
+        # Validate folder name
+        if not folder_name or folder_name.strip() == '':
+            logging.error("Invalid folder name: folder name is empty")
+            return None
+            
+        folder_name = folder_name.strip()
+        parts.append(folder_name)
+        logging.debug(f"parts after adding folder name: {parts}")
+        
+        # Create root folder if it doesn't exist
+        root_folder_path = os.path.join(symlinked_path, folder_name)
+        if not os.path.exists(root_folder_path):
+            try:
+                os.makedirs(root_folder_path, exist_ok=True)
+                logging.info(f"Created root folder: {root_folder_path}")
+            except Exception as e:
+                logging.error(f"Failed to create root folder {root_folder_path}: {str(e)}")
+                return None
         
         # Prepare common template variables
         template_vars = {
@@ -44,6 +106,10 @@ def get_symlink_path(item: Dict[str, Any], original_file: str) -> str:
             'content_source': item.get('content_source', ''),  # Add content source for template use
             'resolution': item.get('resolution', '')  # Add resolution for template use
         }
+
+        if item.get('filename_real_path'):
+            logging.debug(f"Using filename_real_path for original_filename: {item.get('filename_real_path')}")
+            template_vars['original_filename'] = os.path.splitext(item.get('filename_real_path'))[0]
         
         if media_type == 'movie':
             # Get the template for movies
@@ -98,15 +164,21 @@ def get_symlink_path(item: Dict[str, Any], original_file: str) -> str:
             if i == len(path_parts) - 1:
                 if not sanitized_part.endswith(extension):
                     sanitized_part += extension
-                # Check if filename exceeds max length
-                max_filename_length = 247
-                filename_without_ext = os.path.splitext(sanitized_part)[0]
-                if len(sanitized_part) > max_filename_length:
-                    # Truncate the filename part only, preserving extension
-                    excess = len(sanitized_part) - max_filename_length
+                
+                # Check if full path would exceed max length (260 chars for Windows)
+                max_path_length = 255
+                dir_path = os.path.join(symlinked_path, *parts)
+                full_path = os.path.join(dir_path, sanitized_part)
+                
+                if len(full_path) > max_path_length:
+                    # Calculate how much we need to truncate
+                    excess = len(full_path) - max_path_length
+                    filename_without_ext = os.path.splitext(sanitized_part)[0]
+                    # Add 3 more chars for the "..." we'll add
                     truncated = filename_without_ext[:-excess-3] + "..."
                     sanitized_part = truncated + extension
-                    logging.debug(f"Truncated filename from {len(filename_without_ext + extension)} to {len(sanitized_part)} chars: {sanitized_part}")
+                    logging.debug(f"Truncated full path from {len(full_path)} to {len(os.path.join(dir_path, sanitized_part))} chars")
+                
                 # For the final part (filename), we'll add it later
                 final_filename = sanitized_part
             else:
@@ -114,6 +186,14 @@ def get_symlink_path(item: Dict[str, Any], original_file: str) -> str:
         
         # Create the directory path first
         dir_path = os.path.join(symlinked_path, *parts)
+        
+        # Ensure the full directory path exists
+        try:
+            os.makedirs(dir_path, exist_ok=True)
+            logging.debug(f"Ensured directory path exists: {dir_path}")
+        except Exception as e:
+            logging.error(f"Failed to create directory path {dir_path}: {str(e)}")
+            return None
         
         # Then join with the final filename
         base_path = os.path.join(dir_path, os.path.splitext(final_filename)[0])
@@ -129,7 +209,7 @@ def get_symlink_path(item: Dict[str, Any], original_file: str) -> str:
         logging.error(f"Error getting symlink path: {str(e)}")
         return None
 
-def create_symlink(source_path: str, dest_path: str) -> bool:
+def create_symlink(source_path: str, dest_path: str, media_item_id: int = None) -> bool:
     """Create a symlink from source to destination path."""
     try:
         dest_dir = os.path.dirname(dest_path)
@@ -156,6 +236,15 @@ def create_symlink(source_path: str, dest_path: str) -> bool:
         # Create the symlink
         os.symlink(source_path, dest_path)
         logging.info(f"Created symlink: {source_path} -> {dest_path}")
+
+        # Add to verification queue if media_item_id is provided and library type is Symlinked/Local
+        if media_item_id and get_setting('File Management', 'file_collection_management') == 'Symlinked/Local':
+            try:
+                from database.symlink_verification import add_symlinked_file_for_verification
+                add_symlinked_file_for_verification(media_item_id, dest_path)
+                logging.info(f"Added file to verification queue: {dest_path}")
+            except Exception as e:
+                logging.error(f"Failed to add file to verification queue: {str(e)}")
 
         return True
     except Exception as e:
@@ -201,8 +290,29 @@ def check_local_file_for_item(item: Dict[str, Any], is_webhook: bool = False, ex
             # First try the original path construction
             source_file = os.path.join(original_path, item.get('filled_by_title', ''), item['filled_by_file'])
             logging.debug(f"Trying original source file path: {source_file}")
-            
-            if extended_search:
+            found_file = False
+
+            # Always try both standard paths
+            if os.path.exists(source_file):
+                logging.debug(f"Found file at original path: {source_file}")
+                found_file = True
+            else:
+                logging.debug(f"File not found at original path: {source_file}")
+                # Try path with extension stripped from directory name
+                title_dir = os.path.dirname(source_file)
+                parent_dir = os.path.dirname(title_dir)
+                title_without_ext = os.path.splitext(os.path.basename(title_dir))[0]
+                source_file_no_ext = os.path.join(parent_dir, title_without_ext, os.path.basename(source_file))
+                
+                if os.path.exists(source_file_no_ext):
+                    source_file = source_file_no_ext
+                    logging.info(f"Found file at path with extension stripped: {source_file}")
+                    found_file = True
+                else:
+                    logging.debug(f"File not found at stripped extension path: {source_file_no_ext}")
+
+            # If file not found and extended search is enabled, try find command
+            if not found_file and extended_search:
                 # Only do extended search if item is not in a downloading state
                 torrent_id = item.get('filled_by_torrent_id')
                 is_downloading = False
@@ -218,27 +328,27 @@ def check_local_file_for_item(item: Dict[str, Any], is_webhook: bool = False, ex
                     except Exception as e:
                         logging.debug(f"Failed to check torrent status: {str(e)}")
 
-                # Only perform extended search if not downloading
+                # Only perform find command search if not downloading
                 if not is_downloading:
-                    # If file doesn't exist at the original path, search for it using find command
-                    found_path = None
-                    if not os.path.exists(source_file):
-                        logging.debug(f"File not found at original path, searching in {original_path}")
-                        found_path = find_file(item['filled_by_file'], original_path)
-                        if found_path:
-                            source_file = found_path
-                            # Update the filled_by_title to match the actual folder structure
-                            item['filled_by_title'] = os.path.basename(os.path.dirname(found_path))
-                            logging.info(f"Found file at alternate location: {source_file}")
-            
-            if not os.path.exists(source_file):
+                    logging.debug(f"Attempting broad search in: {original_path}")
+                    found_path = find_file(item['filled_by_file'], original_path)
+                    if found_path:
+                        source_file = found_path
+                        # Update the filled_by_title to match the actual folder structure
+                        item['filled_by_title'] = os.path.basename(os.path.dirname(found_path))
+                        logging.info(f"Found file using find command: {source_file}")
+                        found_file = True
+                    else:
+                        logging.debug(f"File not found after exhaustive search")
+
+            if not found_file:
                 if is_webhook and attempt < max_retries - 1:
                     logging.info(f"File not found, attempt {attempt + 1}/{max_retries}. Retrying in {retry_delay} second...")
                     time.sleep(retry_delay)
                     continue
-                logging.warning(f"Original file not found: {source_file}")
+                logging.warning(f"File not found in any checked location")
                 return False
-                
+            
             # Get destination path based on settings
             dest_file = get_symlink_path(item, source_file)
             if not dest_file:
@@ -246,18 +356,29 @@ def check_local_file_for_item(item: Dict[str, Any], is_webhook: bool = False, ex
             
             success = False
             
+            # Create item identifier first
+            item_identifier = f"{item.get('title')} ({item.get('year', '')})"
+            if item.get('type') == 'episode':
+                item_identifier += f" S{item.get('season_number', '00'):02d}E{item.get('episode_number', '00'):02d}"
+            
             # Check if this is a potential upgrade based on release date
-            release_date = datetime.strptime(item.get('release_date', '1970-01-01'), '%Y-%m-%d').date()
-            days_since_release = (datetime.now().date() - release_date).days
+            if item.get('release_date', '').lower() in ['unknown', 'none', '']:
+                # Treat unknown release dates as very recent (0 days since release)
+                logging.debug(f"[UPGRADE] Unknown release date for {item_identifier} - treating as new content")
+                days_since_release = 0
+            else:
+                try:
+                    release_date = datetime.strptime(item.get('release_date', '1970-01-01'), '%Y-%m-%d').date()
+                    days_since_release = (datetime.now().date() - release_date).days
+                except ValueError:
+                    # Handle invalid but non-empty release dates by treating them as new
+                    logging.debug(f"[UPGRADE] Invalid release date format: {item.get('release_date')} - treating as new content")
+                    days_since_release = 0
             
             # If release is within last 7 days and upgrading is enabled, treat as potential upgrade
             is_upgrade_candidate = days_since_release <= 7 and get_setting("Scraping", "enable_upgrading", default=False)
             
             # Log upgrade status
-            item_identifier = f"{item.get('title')} ({item.get('year', '')})"
-            if item.get('type') == 'episode':
-                item_identifier += f" S{item.get('season_number', '00'):02d}E{item.get('episode_number', '00'):02d}"
-            
             logging.debug(f"[UPGRADE] Processing item: {item_identifier}")
             logging.debug(f"[UPGRADE] Days since release: {days_since_release}")
             logging.debug(f"[UPGRADE] Is upgrade candidate: {is_upgrade_candidate}")
@@ -269,14 +390,33 @@ def check_local_file_for_item(item: Dict[str, Any], is_webhook: bool = False, ex
             if item.get('upgrading_from'):
                 logging.info(f"[UPGRADE] Processing confirmed upgrade for {item_identifier}")
                 # Remove old torrent from debrid service if we have the ID
+                is_downloading = False
                 if item.get('filled_by_torrent_id'):
                     try:
                         from debrid import get_debrid_provider
                         debrid_provider = get_debrid_provider()
-                        debrid_provider.remove_torrent(item['upgrading_from_torrent_id'])
-                        logging.info(f"[UPGRADE] Removed old torrent {item['upgrading_from_torrent_id']} from debrid service")
+                        torrent_id = item.get('filled_by_torrent_id')
+                        torrent_info = debrid_provider.get_torrent_info(torrent_id)
+                        if torrent_info:
+                            progress = torrent_info.get('progress', 0)
+                            is_downloading = progress > 0 and progress < 100
                     except Exception as e:
-                        logging.error(f"[UPGRADE] Failed to remove old torrent {item['filled_by_torrent_id']}: {str(e)}")
+                        logging.debug(f"Failed to check torrent status: {str(e)}")
+
+                # Only perform cleanup if not downloading
+                if not is_downloading:
+                    # Remove old torrent from debrid service if we have the ID
+                    if item.get('filled_by_torrent_id'):
+                        try:
+                            from debrid import get_debrid_provider
+                            debrid_provider = get_debrid_provider()
+                            debrid_provider.remove_torrent(
+                                item['upgrading_from_torrent_id'],
+                                removal_reason="Removed old torrent after successful upgrade"
+                            )
+                            logging.info(f"[UPGRADE] Removed old torrent {item['upgrading_from_torrent_id']} from debrid service")
+                        except Exception as e:
+                            logging.error(f"[UPGRADE] Failed to remove old torrent {item['filled_by_torrent_id']}: {str(e)}")
                 
                 # Remove old symlink if it exists
                 # Use the old file's name to get the old symlink path
@@ -295,20 +435,25 @@ def check_local_file_for_item(item: Dict[str, Any], is_webhook: bool = False, ex
                 if old_dest and os.path.lexists(old_dest):
                     try:
                         os.unlink(old_dest)
-                        logging.info(f"[UPGRADE] Removed old symlink during upgrade: {old_dest}")                                            
+                        logging.info(f"[UPGRADE] Removed old symlink during upgrade: {old_dest}")
+                        # Wait for media server to detect the removed symlink
+                        time.sleep(1)
+                        
+                        # Remove the old file from Plex or Emby
+                        if get_setting('Debug', 'emby_url', default=False):
+                            from utilities.emby_functions import remove_file_from_emby
+                            remove_file_from_emby(item['title'], old_dest, item.get('type') == 'episode' and item.get('episode_title'))
+                        elif get_setting('File Management', 'plex_url_for_symlink', default=False):
+                            from utilities.plex_functions import remove_file_from_plex
+                            remove_file_from_plex(item['title'], old_dest, item.get('type') == 'episode' and item.get('episode_title'))
+
                     except Exception as e:
                         logging.error(f"[UPGRADE] Failed to remove old symlink {old_dest}: {str(e)}")
                 else:
                     logging.debug(f"[UPGRADE] No old symlink found at {old_dest}")
-
-                # Remove the old file from Plex
-                from utilities.plex_functions import remove_file_from_plex
-                # Sleep for 0.5 seconds to give plex time to remove the file
-                # time.sleep(0.5)
-                remove_file_from_plex(item['title'], old_dest, item.get('type') == 'episode' and item.get('episode_title'))
-
+            
             if not os.path.exists(dest_file):
-                success = create_symlink(source_file, dest_file)
+                success = create_symlink(source_file, dest_file, item.get('id'))
                 logging.debug(f"[UPGRADE] Created new symlink: {success}")
             else:
                 # Verify existing symlink points to correct source
@@ -320,7 +465,7 @@ def check_local_file_for_item(item: Dict[str, Any], is_webhook: bool = False, ex
                     else:
                         # Recreate symlink if pointing to wrong source
                         os.unlink(dest_file)
-                        success = create_symlink(source_file, dest_file)
+                        success = create_symlink(source_file, dest_file, item.get('id'))
                         logging.debug(f"[UPGRADE] Recreated symlink with correct source: {success}")
                 else:
                     logging.warning(f"[UPGRADE] Destination exists but is not a symlink: {dest_file}")
@@ -328,7 +473,6 @@ def check_local_file_for_item(item: Dict[str, Any], is_webhook: bool = False, ex
 
             if success:
                 logging.info(f"[UPGRADE] Successfully processed symlink at: {dest_file}")
-                from database.database_writing import update_media_item
                 
                 # Set state based on whether this is an upgrade candidate
                 new_state = 'Upgrading' if is_upgrade_candidate else 'Collected'
@@ -338,7 +482,7 @@ def check_local_file_for_item(item: Dict[str, Any], is_webhook: bool = False, ex
                 
                 # Prepare update values
                 update_values = {
-                    'location_on_disk': dest_file,
+                        'location_on_disk': dest_file,
                     'collected_at': current_time,
                     'original_collected_at': current_time,
                     'original_path_for_symlink': source_file,
@@ -347,15 +491,20 @@ def check_local_file_for_item(item: Dict[str, Any], is_webhook: bool = False, ex
                     'filled_by_file': item.get('filled_by_file'),
                     'filled_by_magnet': item.get('filled_by_magnet'),
                     'filled_by_torrent_id': item.get('filled_by_torrent_id'),
-                    'resolution': item.get('resolution')
+                    'resolution': item.get('resolution'),
+                    'upgrading_from': item.get('upgrading_from')  # Always include upgrading_from
                 }
-                
-                # Only set upgrading_from if this is a confirmed upgrade
-                if item.get('upgrading_from'):
-                    update_values['upgrading_from'] = item['upgrading_from']
                 
                 logging.debug(f"[UPGRADE] Updating item with values: {update_values}")
                 update_media_item(item['id'], **update_values)
+
+                # Add post-processing call after state update
+                updated_item = get_media_item_by_id(item['id'])
+                if updated_item:
+                    if new_state == 'Collected':
+                        handle_state_change(dict(updated_item))
+                    elif new_state == 'Upgrading':
+                        handle_state_change(dict(updated_item))
 
                 # Add notification for all collections (including previously collected)
                 if not item.get('upgrading_from'):
@@ -374,8 +523,7 @@ def check_local_file_for_item(item: Dict[str, Any], is_webhook: bool = False, ex
                     notification_item['is_upgrade'] = True
                     notification_item['new_state'] = 'Upgraded'
                     add_to_collected_notifications(notification_item)
-                    logging.info(f"Added upgrade notification for item: {item_identifier}")
-
+            
             return success
             
         except Exception as e:
@@ -385,7 +533,7 @@ def check_local_file_for_item(item: Dict[str, Any], is_webhook: bool = False, ex
                 continue
             logging.error(f"[UPGRADE] Error checking local file for item: {str(e)}")
             return False
-            
+    
     return False
 
 def local_library_scan(items: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
@@ -443,7 +591,7 @@ def local_library_scan(items: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]
                         # Create symlink if it doesn't exist
                         success = False
                         if not os.path.exists(dest_file):
-                            success = create_symlink(source_file, dest_file)
+                            success = create_symlink(source_file, dest_file, item.get('id'))
                         else:
                             # Verify existing symlink points to correct source
                             if os.path.islink(dest_file):
@@ -453,7 +601,7 @@ def local_library_scan(items: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]
                                 else:
                                     # Recreate symlink if pointing to wrong source
                                     os.unlink(dest_file)
-                                    success = create_symlink(source_file, dest_file)
+                                    success = create_symlink(source_file, dest_file, item.get('id'))
                             else:
                                 logging.warning(f"Destination exists but is not a symlink: {dest_file}")
                                 continue
@@ -530,7 +678,7 @@ def recent_local_library_scan(items: List[Dict[str, Any]], max_files: int = 500)
                 
                 # Create symlink if it doesn't exist
                 if not os.path.exists(dest_file):
-                    if create_symlink(source_file, dest_file):
+                    if create_symlink(source_file, dest_file, target_files[filename].get('id')):
                         item = target_files[filename]
                         found_items[item['id']] = {
                             'location': dest_file,
@@ -561,6 +709,8 @@ def convert_item_to_symlink(item: Dict[str, Any]) -> Dict[str, Any]:
     Returns a dict with success status and details about the conversion.
     """
     try:
+        logging.debug(f"convert_item_to_symlink received item with filename_real_path: {item.get('filename_real_path')}")
+        
         if not item.get('location_on_disk'):
             return {
                 'success': False,
@@ -578,6 +728,7 @@ def convert_item_to_symlink(item: Dict[str, Any]) -> Dict[str, Any]:
             }
 
         # Get destination path based on settings
+        logging.debug(f"Calling get_symlink_path with filename_real_path: {item.get('filename_real_path')}")
         dest_file = get_symlink_path(item, source_file)
         if not dest_file:
             return {
@@ -589,7 +740,7 @@ def convert_item_to_symlink(item: Dict[str, Any]) -> Dict[str, Any]:
         # Create symlink if it doesn't exist
         success = False
         if not os.path.exists(dest_file):
-            success = create_symlink(source_file, dest_file)
+            success = create_symlink(source_file, dest_file, item.get('id'))
         else:
             # Verify existing symlink points to correct source
             if os.path.islink(dest_file):
@@ -599,7 +750,7 @@ def convert_item_to_symlink(item: Dict[str, Any]) -> Dict[str, Any]:
                 else:
                     # Recreate symlink if pointing to wrong source
                     os.unlink(dest_file)
-                    success = create_symlink(source_file, dest_file)
+                    success = create_symlink(source_file, dest_file, item.get('id'))
             else:
                 return {
                     'success': False,

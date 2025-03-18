@@ -2,6 +2,21 @@
 
 cli_debrid is a successor to, and pays homage to plex_debrid. cli_debrid is designed to automatically manage and upgrade your media collection, leveraging various sources and services to ensure you always have the best quality content available.
 
+## How can you support the project?
+
+[![](https://img.shields.io/static/v1?label=Sponsor&message=%E2%9D%A4&logo=GitHub&color=%23fe8e86)](https://github.com/sponsors/godver3)
+[![Support me on Patreon](https://img.shields.io/endpoint.svg?url=https%3A%2F%2Fshieldsio-patreon.vercel.app%2Fapi%3Fusername%3Dgodver3%26type%3Dpatrons&style=flat)](https://patreon.com/godver3)
+
+## Version Information
+
+*Main Branch*
+
+![Main Branch Version](https://img.shields.io/endpoint?url=https://version.godver3.xyz/version/main)
+
+*Dev Branch*
+
+![Dev Branch Version](https://img.shields.io/endpoint?url=https://version.godver3.xyz/version/dev&color=orange&logoColor=orange)
+
 ## Community
 
 - [Discord](https://discord.gg/jAmqZJCZJ4)
@@ -39,9 +54,11 @@ The core functionality of the software. When started, it:
 
 ### dev vs main
 
-dev is the latest version of cli_debrid, and is built for arm64 and amd64. It is not recommended for production use.
+dev is the latest version of cli_debrid. It is not recommended for production use, unless you are brave.
 
-main is the stable version of cli_debrid, and is built for amd64. It is recommended for production use.
+main is the stable version of cli_debrid. It is recommended for production use.
+
+Development generally works on a 2-3 week cycle, with dev being moved to main at the end of each cycle.
 
 ### Library Management
 
@@ -202,7 +219,7 @@ cli_debrid maintains a local database of your media collection, keeping track of
 - Docker and Docker Compose installed on your system
 - A Plex server
 - An Overseerr instance
-- A Real-Debrid or Torbox account
+- A Real-Debrid or account
 
 ### Setup Instructions
 
@@ -282,7 +299,7 @@ cli_debrid will always be free for anyone to use.
 Thanks to:
 
 - Various other projects that have come before this one, and likely do things better in many ways
-- Specific thanks to the NyaaPy and PTT/Parsett libraries (https://github.com/JuanjoSalvador/NyaaPy and https://github.com/dreulavelle/PTT)
+- Specific thanks to the NyaaPy, PTT/Parsett, and downsub libraries (https://github.com/JuanjoSalvador/NyaaPy, https://github.com/dreulavelle/PTT, and https://github.com/ericvlog/Downsub)
 - The original creator of plex_debrid
 - Helpful communities of content creators
 
