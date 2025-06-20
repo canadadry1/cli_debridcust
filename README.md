@@ -19,7 +19,7 @@ cli_debrid is a successor to, and pays homage to plex_debrid. cli_debrid is desi
 
 ## Community
 
-- [Discord](https://discord.gg/jAmqZJCZJ4)
+- [Discord](https://discord.gg/ynqnXGJ4hU)
 - Feel free to join and ask questions or to share ideas.
 
 ## Screenshots
