@@ -1,5 +1,99 @@
+# Open the file: cli_debrid/database/maintenance.py
+# If this file does NOT exist, create a new file at this path
+# and paste the entire content below into it.
+
 import logging
 import os
+import sqlite3
+from .core import get_db_connection, retry_on_db_lock
+# from utilities.plex_functions import trigger_plex_scan # Uncomment and import if you have this function
+
+logger = logging.getLogger(__name__)
+
+@retry_on_db_lock()
+def delete_media_item_and_symlink_and_db_entry(item_id: int) -> bool:
+    """
+    Deletes a media item from the 'media_items' table, its corresponding
+    entry in 'symlinked_files_verification', and attempts to remove the
+    physical symlink file from disk. Optionally triggers a Plex scan.
+
+    Args:
+        item_id: The primary key ID of the media item to delete.
+
+    Returns:
+        True if the item was found and deletion process initiated, False otherwise.
+        Note: File deletion and Plex scan might fail independently.
+    """
+    conn = get_db_connection()
+    symlink_path = None
+    try:
+        cursor = conn.cursor()
+
+        # Step 1: Retrieve symlink path before deleting the main entry
+        # We need to fetch location_on_disk from media_items
+        cursor.execute("SELECT location_on_disk FROM media_items WHERE id = ?", (item_id,))
+        result = cursor.fetchone()
+        if result:
+            symlink_path = result['location_on_disk']
+        else:
+            logger.warning(f"No media item found with ID: {item_id} for deletion.")
+            return False # Item not found in media_items table
+
+        # Start a transaction for atomicity
+        conn.execute("BEGIN TRANSACTION;")
+
+        # Step 2: Delete from 'media_items' table
+        cursor.execute("DELETE FROM media_items WHERE id = ?", (item_id,))
+        rows_deleted_media_items = cursor.rowcount
+
+        # Step 3: Delete from 'symlinked_files_verification' table
+        cursor.execute("DELETE FROM symlinked_files_verification WHERE media_item_id = ?", (item_id,))
+        rows_deleted_symlinks_verification = cursor.rowcount
+        
+        conn.commit() # Commit database changes
+
+        if rows_deleted_media_items > 0:
+            logger.info(f"Successfully deleted media item ID: {item_id} from media_items table.")
+            if rows_deleted_symlinks_verification > 0:
+                logger.info(f"Successfully deleted {rows_deleted_symlinks_verification} entries from symlinked_files_verification for media item ID: {item_id}.")
+            else:
+                logger.info(f"No entries found in symlinked_files_verification for media item ID: {item_id}.")
+
+            # Step 4: Attempt to remove the physical symlink file
+            if symlink_path and os.path.exists(symlink_path):
+                try:
+                    os.remove(symlink_path)
+                    logger.info(f"Successfully removed physical symlink file: {symlink_path}")
+                    # Step 5 (Optional): Trigger a Plex scan
+                    # You would need to implement or call your Plex scan function here.
+                    # Example:
+                    # if trigger_plex_scan:
+                    #     # You might need to determine the specific Plex library section ID or path
+                    #     # based on symlink_path or other metadata. This is a placeholder.
+                    #     trigger_plex_scan(library_path_or_id_associated_with_symlink_path)
+                    #     logger.info(f"Triggered Plex scan after deleting symlink: {symlink_path}")
+
+                except OSError as file_error:
+                    logger.error(f"Error removing symlink file {symlink_path}: {file_error}")
+                    # Log the error but don't re-raise, as DB deletion was successful
+            else:
+                logger.info(f"No physical symlink found on disk for media item ID: {item_id} at path '{symlink_path}'.")
+            
+            return True
+        else:
+            logger.warning(f"No media item found with ID: {item_id} to delete from media_items table.")
+            return False
+
+    except sqlite3.Error as e:
+        conn.rollback() # Rollback changes if any database error occurs
+        logger.error(f"Database error during deletion of media item ID {item_id}: {e}", exc_info=True)
+        raise # Re-raise to be caught by the Flask route
+    except Exception as e:
+        conn.rollback() # Rollback changes for other unexpected errors
+        logger.error(f"Unexpected error during deletion of media item ID {item_id}: {e}", exc_info=True)
+        raise # Re-raise to be caught by the Flask route
+    finally:
+        conn.close()
 
 def update_show_ids():
     """Update show IDs (imdb_id and tmdb_id) in the database if they don't match the direct API."""
