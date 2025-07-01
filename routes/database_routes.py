@@ -1,3 +1,5 @@
+# File: godver3/cli_debrid/cli_debrid-c51ff53e5123ef56c2eb4bcb3e5f00dbae792c0d/routes/database_routes.py
+
 from flask import jsonify, request, render_template, session, flash, Blueprint, current_app
 import sqlite3
 import string
@@ -5,17 +7,58 @@ from database import get_db_connection, get_all_media_items, update_media_item_s
 import logging
 from sqlalchemy import text, inspect
 from extensions import db
-from database import remove_from_media_items
+from database import remove_from_media_items # This might still be used elsewhere, but not for granular deletion
 from settings import get_setting
 import json
 from reverse_parser import get_version_settings, get_default_version, get_version_order, parse_filename_for_version
 from .models import admin_required
-from utilities.plex_functions import remove_file_from_plex
-from database.database_reading import get_media_item_by_id
+from utilities.plex_functions import remove_file_from_plex # This might still be used elsewhere
+from database.database_reading import get_media_item_by_id # This might still be used elsewhere
 import os
 from datetime import datetime
 from time import sleep
-database_bp = Blueprint('database', __name__)
+
+# Import necessary Flask-Login components
+from flask_login import login_required, current_user
+
+# Import the new comprehensive deletion function
+from database.maintenance import delete_media_item_and_symlink_and_db_entry
+
+# Define the Blueprint. Using 'database_bp' for consistency with the new route.
+database_bp = Blueprint('database_bp', __name__)
+logger = logging.getLogger(__name__)
+
+
+@database_bp.route('/api/media_items/<int:item_id>', methods=['DELETE'])
+@login_required # Ensures only authenticated users can access
+@admin_required # Ensures only admin users can access (assuming this decorator works with Flask-Login)
+def delete_media_item_api(item_id):
+    """
+    API endpoint to delete a single media item from the database,
+    its associated symlink, and relevant verification entries.
+    Requires admin privileges.
+    """
+    # The admin_required decorator should handle the authorization,
+    # but an explicit check can be kept for clarity or if decorator is not fully implemented.
+    if not current_user.is_authenticated or not current_user.is_admin:
+        logger.warning(f"Unauthorized attempt to delete media item ID: {item_id} by user: {current_user.id if current_user.is_authenticated else 'anonymous'}")
+        return jsonify({'error': 'Unauthorized: Admin access required.'}), 403
+
+    try:
+        # Call the comprehensive deletion function
+        success = delete_media_item_and_symlink_and_db_entry(item_id)
+        
+        if success:
+            logger.info(f"User {current_user.username} successfully deleted media item ID: {item_id} (and symlink if existed).")
+            return jsonify({'message': f'Media item {item_id} deleted successfully.'}), 200
+        else:
+            logger.warning(f"Media item ID: {item_id} not found or could not be deleted.")
+            return jsonify({'error': f'Media item {item_id} not found or could not be deleted.'}), 404
+            
+    except Exception as e:
+        logger.error(f"Error deleting media item {item_id}: {e}", exc_info=True)
+        return jsonify({'error': f'An error occurred during deletion: {str(e)}'}), 500
+
 
 @database_bp.route('/', methods=['GET', 'POST'])
 @admin_required
@@ -156,11 +199,15 @@ def index():
         return render_template('database.html', **{**data, 'items': []})
 
 @database_bp.route('/bulk_queue_action', methods=['POST'])
+@login_required
+@admin_required
 def bulk_queue_action():
     action = request.form.get('action')
     target_queue = request.form.get('target_queue')
     selected_items = request.form.getlist('selected_items')
-    blacklist = request.form.get('blacklist', 'false').lower() == 'true'
+    # The 'blacklist' parameter from the old delete_item is not directly used here
+    # as delete_media_item_and_symlink_and_db_entry handles full deletion.
+    # If a 'blacklist only' action is desired, it would need a separate function.
 
     if not action or not selected_items:
         return jsonify({'success': False, 'error': 'Action and selected items are required'})
@@ -172,99 +219,84 @@ def bulk_queue_action():
     errors = []
     
     try:
-        for i in range(0, len(selected_items), BATCH_SIZE):
-            batch = selected_items[i:i + BATCH_SIZE]
-            
-            if action == 'delete':
-                # Process each item in the batch through delete_item
-                for item_id in batch:
-                    try:
-                        # Create a new request with our data
-                        with current_app.test_request_context(
-                            method='POST',
-                            data=json.dumps({
-                                'item_id': item_id,
-                                'blacklist': blacklist
-                            }),
-                            content_type='application/json'
-                        ):
-                            response = delete_item()
-                            
-                            if isinstance(response, tuple):
-                                success = response[0].json.get('success', False)
-                            else:
-                                success = response.json.get('success', False)
-                                
-                            if success:
-                                total_processed += 1
-                            else:
-                                error_count += 1
-                                error_msg = response.json.get('error', 'Unknown error')
-                                errors.append(f"Error processing item {item_id}: {error_msg}")
-                                
-                    except Exception as e:
-                        error_count += 1
-                        errors.append(f"Error processing item {item_id}: {str(e)}")
-                        logging.error(f"Error processing item {item_id} in bulk delete: {str(e)}")
-                        
-            elif action == 'move' and target_queue:
-                # Keep existing move functionality
-                conn = get_db_connection()
+        if action == 'delete':
+            # Process each item in the batch through the new comprehensive delete function
+            for item_id_str in selected_items:
                 try:
-                    cursor = conn.cursor()
-                    placeholders = ','.join('?' * len(batch))
-                    cursor.execute(
-                        f'UPDATE media_items SET state = ?, last_updated = ? WHERE id IN ({placeholders})',
-                        [target_queue, datetime.now()] + batch
-                    )
-                    total_processed += cursor.rowcount
-                    conn.commit()
+                    item_id = int(item_id_str)
+                    success = delete_media_item_and_symlink_and_db_entry(item_id)
+                    if success:
+                        total_processed += 1
+                    else:
+                        error_count += 1
+                        errors.append(f"Error processing item {item_id}: Item not found or could not be deleted.")
+                except ValueError:
+                    error_count += 1
+                    errors.append(f"Invalid item ID format: {item_id_str}")
+                    logging.error(f"Invalid item ID format in bulk delete: {item_id_str}")
                 except Exception as e:
                     error_count += 1
-                    conn.rollback()
-                    errors.append(f"Error in batch {i//BATCH_SIZE + 1}: {str(e)}")
-                    logging.error(f"Error in batch {i//BATCH_SIZE + 1}: {str(e)}")
-                finally:
-                    conn.close()
-            elif action == 'change_version' and target_queue:  # target_queue contains the version in this case
-                conn = get_db_connection()
-                try:
+                    errors.append(f"Error processing item {item_id_str}: {str(e)}")
+                    logging.error(f"Error processing item {item_id_str} in bulk delete: {str(e)}")
+                        
+        elif action == 'move' and target_queue:
+            # Keep existing move functionality
+            conn = get_db_connection()
+            try:
+                cursor = conn.cursor()
+                placeholders = ','.join('?' * len(selected_items))
+                cursor.execute(
+                    f'UPDATE media_items SET state = ?, last_updated = ? WHERE id IN ({placeholders})',
+                    [target_queue, datetime.now()] + selected_items
+                )
+                total_processed += cursor.rowcount
+                conn.commit()
+            except Exception as e:
+                error_count += 1
+                conn.rollback()
+                errors.append(f"Error in batch: {str(e)}")
+                logging.error(f"Error in batch: {str(e)}")
+            finally:
+                conn.close()
+        elif action == 'change_version' and target_queue:  # target_queue contains the version in this case
+            conn = get_db_connection()
+            try:
                     cursor = conn.cursor()
-                    placeholders = ','.join('?' * len(batch))
+                    placeholders = ','.join('?' * len(selected_items))
                     cursor.execute(
                         f'UPDATE media_items SET version = ?, last_updated = ? WHERE id IN ({placeholders})',
-                        [target_queue, datetime.now()] + batch
+                        [target_queue, datetime.now()] + selected_items
                     )
                     total_processed += cursor.rowcount
                     conn.commit()
-                except Exception as e:
-                    error_count += 1
-                    conn.rollback()
-                    errors.append(f"Error in batch {i//BATCH_SIZE + 1}: {str(e)}")
-                    logging.error(f"Error in batch {i//BATCH_SIZE + 1}: {str(e)}")
-                finally:
-                    conn.close()
-            elif action == 'early_release':
-                # Handle early release action
-                conn = get_db_connection()
-                try:
-                    cursor = conn.cursor()
-                    placeholders = ','.join('?' * len(batch))
-                    cursor.execute(
-                        f'UPDATE media_items SET early_release = TRUE, state = ?, last_updated = ? WHERE id IN ({placeholders})',
-                        ['Wanted', datetime.now()] + batch
-                    )
-                    total_processed += cursor.rowcount
-                    conn.commit()
-                except Exception as e:
-                    error_count += 1
-                    conn.rollback()
-                    errors.append(f"Error in batch {i//BATCH_SIZE + 1}: {str(e)}")
-                    logging.error(f"Error in batch {i//BATCH_SIZE + 1}: {str(e)}")
-                finally:
-                    conn.close()
-            else:
-                return jsonify({'success': False, 'error': 'Invalid action or missing target queue'})
+            except Exception as e:
+                error_count += 1
+                conn.rollback()
+                errors.append(f"Error in batch: {str(e)}")
+                logging.error(f"Error in batch: {str(e)}")
+            finally:
+                conn.close()
+        elif action == 'early_release':
+            # Handle early release action
+            conn = get_db_connection()
+            try:
+                cursor = conn.cursor()
+                placeholders = ','.join('?' * len(selected_items))
+                cursor.execute(
+                    f'UPDATE media_items SET early_release = TRUE, state = ?, last_updated = ? WHERE id IN ({placeholders})',
+                    ['Wanted', datetime.now()] + selected_items
+                )
+                total_processed += cursor.rowcount
+                conn.commit()
+            except Exception as e:
+                error_count += 1
+                conn.rollback()
+                errors.append(f"Error in batch: {str(e)}")
+                logging.error(f"Error in batch: {str(e)}")
+            finally:
+                conn.close()
+        else:
+            return jsonify({'success': False, 'error': 'Invalid action or missing target queue'})
 
         if error_count > 0:
             message = f"Completed with {error_count} errors. Successfully processed {total_processed} items."
@@ -280,80 +312,8 @@ def bulk_queue_action():
         logging.error(f"Error performing bulk action: {str(e)}")
         return jsonify({'success': False, 'error': str(e)})
 
-@database_bp.route('/delete_item', methods=['POST'])
-def delete_item():
-    data = request.json
-    item_id = data.get('item_id')
-    blacklist = data.get('blacklist', False)
-    
-    if not item_id:
-        return jsonify({'success': False, 'error': 'No item ID provided'}), 400
-
-    try:
-        item = get_media_item_by_id(item_id)
-        if not item:
-            return jsonify({'success': False, 'error': 'Item not found'}), 404
-
-        # Get file management settings
-        file_management = get_setting('File Management', 'file_collection_management', 'Plex')
-        mounted_location = get_setting('Plex', 'mounted_file_location', get_setting('File Management', 'original_files_path', ''))
-        original_files_path = get_setting('File Management', 'original_files_path', '')
-        symlinked_files_path = get_setting('File Management', 'symlinked_files_path', '')
-
-        # Handle file deletion based on management type
-        if file_management == 'Plex' and (item['state'] == 'Collected' or item['state'] == 'Upgrading'):
-            if mounted_location and item.get('location_on_disk'):
-                try:
-                    if os.path.exists(item['location_on_disk']):
-                        os.remove(item['location_on_disk'])
-                except Exception as e:
-                    logging.error(f"Error deleting file at {item['location_on_disk']}: {str(e)}")
-
-            sleep(1)
-
-            if item['type'] == 'movie':
-                remove_file_from_plex(item['title'], item['filled_by_file'])
-            elif item['type'] == 'episode':
-                remove_file_from_plex(item['title'], item['filled_by_file'], item['episode_title'])
-
-        elif file_management == 'Symlinked/Local' and (item['state'] == 'Collected' or item['state'] == 'Upgrading'):
-            # Handle symlink removal
-            if item.get('location_on_disk'):
-                try:
-                    if os.path.exists(item['location_on_disk']) and os.path.islink(item['location_on_disk']):
-                        os.unlink(item['location_on_disk'])
-                except Exception as e:
-                    logging.error(f"Error removing symlink at {item['location_on_disk']}: {str(e)}")
-
-            # Handle original file removal
-            if item.get('original_path_for_symlink'):
-                try:
-                    if os.path.exists(item['original_path_for_symlink']):
-                        os.remove(item['original_path_for_symlink'])
-                except Exception as e:
-                    logging.error(f"Error deleting original file at {item['original_path_for_symlink']}: {str(e)}")
-
-            sleep(1)
-
-            # Remove from Plex if configured
-            plex_url = get_setting('File Management', 'plex_url_for_symlink', '')
-            if plex_url:
-                if item['type'] == 'movie':
-                    remove_file_from_plex(item['title'], os.path.basename(item['location_on_disk']))
-                elif item['type'] == 'episode':
-                    remove_file_from_plex(item['title'], os.path.basename(item['location_on_disk']), item['episode_title'])
-
-        # Handle database operation based on blacklist flag
-        if blacklist:
-            update_media_item_state(item_id, 'Blacklisted')
-        else:
-            remove_from_media_items(item_id)
-
-        return jsonify({'success': True})
-
-    except Exception as e:
-        logging.error(f"Error processing delete request: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+# Removed the old delete_item route as it's superseded by delete_media_item_api
+# and delete_media_item_and_symlink_and_db_entry.
 
 def perform_database_migration():
     # logging.info("Performing database migration...")
