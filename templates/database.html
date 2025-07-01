@@ -1,979 +1,149 @@
+<!-- File: godver3/cli_debrid/cli_debrid-c51ff53e5123ef56c2eb4bcb3e5f00dbae792c0d/templates/database.html -->
+<!--
+    This file has been updated to include:
+    - A new 'Actions' column in the table header.
+    - A delete button for each media item in the table rows.
+    - A hidden custom confirmation modal at the end of the body.
+    - Tailwind CSS classes are used for styling.
+-->
 {% extends "base.html" %}
-{% block title %}Database{% endblock %}
+
+{% block head %}
+    {{ super() }}
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/database.css') }}">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Custom styles for Inter font and general body */
+        body {
+            font-family: 'Inter', sans-serif;
+            @apply bg-gray-900 text-gray-100;
+        }
+        /* Ensure all elements have rounded corners by default */
+        * {
+            border-radius: 0.375rem; /* Equivalent to rounded-md in Tailwind */
+        }
+    </style>
+{% endblock %}
+
 {% block content %}
-<link rel="stylesheet" href="{{ url_for('static', filename='css/database.css') }}">
-<div class="container">
-    <h2>Database Content</h2>
-    <div id="bulk-actions" class="bulk-actions">
-        <div class="select-all-container">
-            <button id="select-all" class="select-all-btn">Select All</button>
-            <button id="bulk-delete" class="bulk-action-btn" disabled>Delete Selected</button>
-            <select id="bulk-move-queue" class="bulk-action-select" disabled>
-                <option value="">Move Selected to Queue...</option>
-                <option value="Adding">Adding</option>
+<div class="container mx-auto px-4 py-8">
+    <h1 class="text-3xl font-bold text-center mb-6">Media Database</h1>
+
+    <!-- Filter and Search Section (Example - expand as needed) -->
+    <div class="bg-gray-800 p-4 rounded-lg shadow-md mb-6 flex flex-wrap items-center justify-between gap-4">
+        <div class="flex-grow">
+            <label for="search" class="sr-only">Search</label>
+            <input type="text" id="search" placeholder="Search by title..." class="w-full px-4 py-2 bg-gray-700 border border-gray-600 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+        </div>
+        <div>
+            <label for="filterState" class="sr-only">Filter by State</label>
+            <select id="filterState" class="px-4 py-2 bg-gray-700 border border-gray-600 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                <option value="">All States</option>
+                <option value="Wanted">Wanted</option>
+                <option value="Collected">Collected</option>
                 <option value="Blacklisted">Blacklisted</option>
                 <option value="Checking">Checking</option>
-                <option value="Scraping">Scraping</option>
-                <option value="Sleeping">Sleeping</option>
-                <option value="Unreleased">Unreleased</option>
-                <option value="Wanted">Wanted</option>
-                <option value="Pending Uncached">Pending Uncached</option>
                 <option value="Upgrading">Upgrading</option>
+                <option value="Sleeping">Sleeping</option>
+                <!-- Add more states as needed -->
             </select>
-            <select id="bulk-change-version" class="bulk-action-select" disabled>
-                <option value="">Change Selected Version...</option>
+        </div>
+        <div>
+            <label for="filterType" class="sr-only">Filter by Type</label>
+            <select id="filterType" class="px-4 py-2 bg-gray-700 border border-gray-600 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                <option value="">All Types</option>
+                <option value="movie">Movie</option>
+                <option value="episode">TV Episode</option>
+                <option value="anime">Anime</option>
+                <!-- Add more types as needed -->
             </select>
-            <button id="bulk-early-release" class="bulk-action-btn" disabled>Mark Selected as Early Release</button>
         </div>
+        <!-- Batch Action Placeholder (will be activated by JS) -->
+        <button id="batchDeleteBtn" class="px-4 py-2 bg-red-600 text-white rounded-md shadow-sm hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-2 hidden">
+            Delete Selected
+        </button>
     </div>
-    <div id="column-selector-wrapper">
-        <button id="toggle-column-selector" class="toggle-button">Select Columns to Display</button>
-        <div id="column-selector" class="hidden">
-            <div class="column-selector-container">
-                <div class="column-list">
-                    <h4>Available Columns</h4>
-                    <select id="available-columns" multiple>
-                        {% for column in all_columns %}
-                            {% if column not in selected_columns %}
-                                <option value="{{ column }}">{{ column }}</option>
-                            {% endif %}
-                        {% endfor %}
-                    </select>
-                </div>
-                <div class="column-buttons">
-                    <button id="add-column">&gt;</button>
-                    <button id="remove-column">&lt;</button>
-                </div>
-                <div class="column-list">
-                    <h4>Selected Columns</h4>
-                    <select id="selected-columns" multiple>
-                        {% for column in selected_columns %}
-                            <option value="{{ column }}">{{ column }}</option>
-                        {% endfor %}
-                    </select>
-                </div>
-            </div>
-            <button id="update-columns">Update View</button>
-        </div>
-    </div>
-    <div id="filter-sort">
-        <h3>Filter and Sort:</h3>
-        <form id="filter-form" class="mb-3">
-            <div>
-                <label for="filter-column">Filter Column:</label>
-                <select id="filter-column" name="filter_column">
-                    <option value="">None</option>
-                    {% for column in selected_columns %}
-                    <option value="{{ column }}" {% if column == filter_column or (not filter_column and column == 'title') %}selected{% endif %}>{{ column }}</option>
-                    {% endfor %}
-                </select>
-                <label for="filter-value">Filter Value:</label>
-                <input type="text" id="filter-value" name="filter_value" value="{{ filter_value }}">
-                <label for="sort-column">Sort Column:</label>
-                <select id="sort-column" name="sort_column">
-                    <option value="">None</option>
-                    {% for column in selected_columns %}
-                    <option value="{{ column }}" {% if column == sort_column %}selected{% endif %}>{{ column }}</option>
-                    {% endfor %}
-                </select>
-                <label for="sort-order">Sort Order:</label>
-                <select id="sort-order" name="sort_order">
-                    <option value="asc" {% if sort_order == 'asc' %}selected{% endif %}>Ascending</option>
-                    <option value="desc" {% if sort_order == 'desc' %}selected{% endif %}>Descending</option>
-                </select>
-            </div>
-            <div class="filter-buttons">
-                <button type="submit">Apply</button>
-                <button id="clear-filter-sort">Clear Filter & Sort</button>
-            </div>
-        </form>
 
-    </div>
-    <div class="content-type-filter">
-        <a href="#" data-content-type="movie" class="content-type-link {% if content_type == 'movie' %}active{% endif %}">Movies</a>
-        <a href="#" data-content-type="episode" class="content-type-link {% if content_type == 'episode' %}active{% endif %}">Episodes</a>
-    </div>
-    <div class="pagination">
-        {% if alphabet %}
-            <a href="#" data-letter="#" class="pagination-link {% if current_letter == '#' %}active{% endif %}">#</a>
-            {% for letter in alphabet %}
-            <a href="#" data-letter="{{ letter }}" class="pagination-link {% if letter == current_letter %}active{% endif %}">{{ letter }}</a>
-            {% endfor %}
-        {% else %}
-            <p>No pagination data available</p>
-        {% endif %}
-    </div>
-</div>
-<div class="table-container">
-    {% if items %}
-        <table>
-            <thead>
+    <div class="overflow-x-auto bg-gray-800 rounded-lg shadow-md">
+        <table class="min-w-full divide-y divide-gray-700 media-items-table">
+            <thead class="bg-gray-700">
                 <tr>
-                    <th>Select</th>
-                    <th>Delete</th>
-                    <th>Rescrape</th>
-                    {% for column in selected_columns %}
-                        <th>{{ column }}</th>
-                    {% endfor %}
+                    <th scope="col" class="px-4 py-3 text-left text-xs font-medium text-gray-300 uppercase tracking-wider">
+                        <input type="checkbox" id="selectAllCheckbox" class="form-checkbox h-4 w-4 text-blue-600 rounded focus:ring-blue-500">
+                    </th>
+                    <th scope="col" class="px-4 py-3 text-left text-xs font-medium text-gray-300 uppercase tracking-wider cursor-pointer sortable" data-sort="title">Title</th>
+                    <th scope="col" class="px-4 py-3 text-left text-xs font-medium text-gray-300 uppercase tracking-wider cursor-pointer sortable" data-sort="type">Type</th>
+                    <th scope="col" class="px-4 py-3 text-left text-xs font-medium text-gray-300 uppercase tracking-wider cursor-pointer sortable" data-sort="state">State</th>
+                    <th scope="col" class="px-4 py-3 text-left text-xs font-medium text-gray-300 uppercase tracking-wider cursor-pointer sortable" data-sort="version">Version</th>
+                    <th scope="col" class="px-4 py-3 text-left text-xs font-medium text-gray-300 uppercase tracking-wider cursor-pointer sortable" data-sort="collected_at">Collected At</th>
+                    <th scope="col" class="px-4 py-3 text-right text-xs font-medium text-gray-300 uppercase tracking-wider">Actions</th>
                 </tr>
             </thead>
-            <tbody>
-                {% for item in items %}
-                    <tr>
-                        <td>
-                            <input type="checkbox" class="item-select" data-item-id="{{ item['id'] }}">
-                        </td>
-                        <td>
-                            <button class="delete-item" data-item-id="{{ item['id'] }}">X</button>
-                        </td>
-                        <td>
-                            <button class="rescrape-item" data-item-id="{{ item['id'] }}">↻</button>
-                        </td>
-                        {% for column in selected_columns %}
-                            <td class="truncate" data-full-content="{{ item[column] }}">{{ item[column] }}</td>
-                        {% endfor %}
-                    </tr>
+            <tbody class="bg-gray-800 divide-y divide-gray-700">
+                {% for item in items.items %}
+                <tr class="hover:bg-gray-700 transition-colors duration-150">
+                    <td class="px-4 py-2 whitespace-nowrap">
+                        <input type="checkbox" class="item-checkbox form-checkbox h-4 w-4 text-blue-600 rounded focus:ring-blue-500" data-id="{{ item.id }}">
+                    </td>
+                    <td class="px-4 py-2 whitespace-nowrap">
+                        <div class="text-sm font-medium text-gray-50 item-title">{{ item.title }}</div>
+                        {% if item.episode_title %}<div class="text-xs text-gray-400">{{ item.episode_title }}</div>{% endif %}
+                    </td>
+                    <td class="px-4 py-2 whitespace-nowrap text-sm text-gray-300">{{ item.type }}</td>
+                    <td class="px-4 py-2 whitespace-nowrap text-sm text-gray-300">{{ item.state }}</td>
+                    <td class="px-4 py-2 whitespace-nowrap text-sm text-gray-300">{{ item.version }}</td>
+                    <td class="px-4 py-2 whitespace-nowrap text-sm text-gray-300">{{ item.collected_at }}</td>
+                    <td class="px-4 py-2 whitespace-nowrap text-right text-sm font-medium action-buttons">
+                        <!-- The delete button for each item -->
+                        <button class="delete-item-btn text-red-600 hover:text-red-900 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-opacity-50 rounded-md py-1 px-2 transition-colors duration-200" data-id="{{ item.id }}" data-title="{{ item.title }}">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 inline-block mr-1" viewBox="0 0 20 20" fill="currentColor">
+                                <path fill-rule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm6 0a1 1 0 012 0v6a1 1 0 11-2 0V8z" clip-rule="evenodd" />
+                            </svg>
+                            Delete
+                        </button>
+                    </td>
+                </tr>
                 {% endfor %}
             </tbody>
         </table>
-    {% else %}
-        <p>No items found in the database.</p>
-    {% endif %}
+    </div>
+
+    <!-- Pagination controls (assuming 'items' is a pagination object) -->
+    <div class="mt-6 flex justify-center items-center space-x-2">
+        {% if items.has_prev %}
+        <a href="{{ url_for('database_bp.database', page=items.prev_num, **request.args) }}" class="px-4 py-2 bg-gray-700 text-gray-300 rounded-md hover:bg-gray-600 transition-colors duration-200">Previous</a>
+        {% endif %}
+        <span class="text-gray-300">Page {{ items.page }} of {{ items.pages }}</span>
+        {% if items.has_next %}
+        <a href="{{ url_for('database_bp.database', page=items.next_num, **request.args) }}" class="px-4 py-2 bg-gray-700 text-gray-300 rounded-md hover:bg-gray-600 transition-colors duration-200">Next</a>
+        {% endif %}
+    </div>
 </div>
 
-<script src="{{ url_for('static', filename='js/loading.js') }}"></script>
-<script type="module">
-import { showPopup, POPUP_TYPES } from '/static/js/notifications.js';
-import { initializeDatabaseTooltips } from '/static/js/tooltips.js';
-
-document.addEventListener('DOMContentLoaded', function() {
-    // Add tap handlers for mobile devices
-    function isMobileDevice() {
-        const hasTouchScreen = (
-            'ontouchstart' in window ||
-            navigator.maxTouchPoints > 0 ||
-            navigator.msMaxTouchPoints > 0
-        );
-        const isMobileViewport = window.innerWidth <= 768;
-        return hasTouchScreen && isMobileViewport;
-    }
-
-    function copyToClipboard(text) {
-        const textarea = document.createElement('textarea');
-        textarea.value = text;
-        document.body.appendChild(textarea);
-        textarea.select();
-        try {
-            document.execCommand('copy');
-            showPopup({
-                type: POPUP_TYPES.SUCCESS,
-                message: 'Content copied to clipboard!',
-                title: 'Success',
-                autoClose: 2000
-            });
-        } catch (err) {
-            showPopup({
-                type: POPUP_TYPES.ERROR,
-                message: 'Failed to copy content',
-                title: 'Error'
-            });
-        }
-        document.body.removeChild(textarea);
-    }
-
-    // Only add mobile functionality if on a mobile device
-    if (isMobileDevice()) {
-        // Add pointer cursor to all truncated cells
-        document.querySelectorAll('.truncate').forEach(cell => {
-            cell.style.cursor = 'pointer';
-        });
-
-        // Use event delegation for cell clicks
-        document.querySelector('.table-container').addEventListener('click', function(e) {
-            const cell = e.target.closest('.truncate');
-            if (cell && !e.target.closest('button')) {
-                const content = cell.getAttribute('data-full-content');
-                    showPopup({
-                        type: POPUP_TYPES.INFO,
-                        title: 'Cell Content',
-                        message: `<div style="word-break: break-word;">${content}</div>`,
-                    });
-                }
-            });
-    }
-
-    let currentContentType = '{{ content_type }}';
-    let currentLetter = '{{ current_letter }}';
-
-    const availableColumns = document.getElementById('available-columns');
-    const selectedColumns = document.getElementById('selected-columns');
-
-    // Only run the column selection logic if both select elements exist
-    if (availableColumns && selectedColumns) {
-        const addColumnBtn = document.getElementById('add-column');
-        const removeColumnBtn = document.getElementById('remove-column');
-        const updateColumnsBtn = document.getElementById('update-columns');
-        const toggleColumnSelectorBtn = document.getElementById('toggle-column-selector');
-        const columnSelector = document.getElementById('column-selector');
-
-        const defaultColumns = ['imdb_id', 'title', 'year', 'release_date', 'state', 'type', 'season_number', 'episode_number', 'collected_at', 'version'];
-
-        const absoluteOrder = [
-            'id', 'imdb_id', 'tmdb_id', 'title', 'year', 'release_date', 'state', 'type',
-            'episode_title', 'season_number', 'episode_number', 'airtime', 'collected_at', 'version'
-        ];
-
-        function sortOptionsWithAbsoluteOrder(selectElement) {
-            const options = Array.from(selectElement.options);
-            options.sort((a, b) => {
-                const indexA = absoluteOrder.indexOf(a.value.toLowerCase());
-                const indexB = absoluteOrder.indexOf(b.value.toLowerCase());
-                
-                if (indexA !== -1 && indexB !== -1) {
-                    return indexA - indexB;
-                } else if (indexA !== -1) {
-                    return -1;
-                } else if (indexB !== -1) {
-                    return 1;
-                } else {
-                    return a.text.localeCompare(b.text);
-                }
-            });
-            options.forEach(option => selectElement.appendChild(option));
-        }
-
-        function moveOptions(fromSelect, toSelect) {
-            Array.from(fromSelect.selectedOptions).forEach(option => {
-                toSelect.appendChild(option);
-            });
-            sortOptionsWithAbsoluteOrder(fromSelect);
-            sortOptionsWithAbsoluteOrder(toSelect);
-        }
-
-        addColumnBtn.addEventListener('click', () => moveOptions(availableColumns, selectedColumns));
-        removeColumnBtn.addEventListener('click', () => moveOptions(selectedColumns, availableColumns));
-        
-        updateColumnsBtn.addEventListener('click', function() {
-            const selectedColumnValues = Array.from(selectedColumns.options).map(option => option.value);
-            
-            const form = document.createElement('form');
-            form.method = 'POST';
-            form.action = window.location.href;
-        
-            selectedColumnValues.forEach(value => {
-                const input = document.createElement('input');
-                input.type = 'hidden';
-                input.name = 'columns';
-                input.value = value;
-                form.appendChild(input);
-            });
-        
-            document.body.appendChild(form);
-            form.submit();
-        });
-        
-        toggleColumnSelectorBtn.addEventListener('click', function() {
-            columnSelector.classList.toggle('hidden');
-            this.classList.toggle('active');
-            this.textContent = columnSelector.classList.contains('hidden') 
-                ? 'Select Columns to Display' 
-                : 'Hide Column Selector';
-        });
-        
-        function initializeColumnSelection() {
-            if (selectedColumns.options.length === 0) {
-                defaultColumns.forEach(column => {
-                    const option = availableColumns.querySelector(`option[value="${column}"]`);
-                    if (option) {
-                        selectedColumns.appendChild(option.cloneNode(true));
-                        option.remove();
-                    }
-                });
-            }
-            
-            sortOptionsWithAbsoluteOrder(availableColumns);
-            sortOptionsWithAbsoluteOrder(selectedColumns);
-        }
-
-        // Initialize column selection
-        initializeColumnSelection();
-    }
-
-    // Filter form logic
-    const filterForm = document.getElementById('filter-form');
-    if (filterForm) {
-        filterForm.addEventListener('submit', function(e) {
-            e.preventDefault();
-            const formData = new FormData(this);
-            const params = Object.fromEntries(formData.entries());
-            updateContent('{{ url_for('database.index') }}', params);
-
-
-        });
-    }
-
-    const clearFilterSortBtn = document.getElementById('clear-filter-sort');
-    
-    if (clearFilterSortBtn) {
-        clearFilterSortBtn.addEventListener('click', function(e) {
-            e.preventDefault();
-            clearFilterAndSort();
-        });
-    }
-
-    function clearFilterAndSort() {
-        // Reset filter inputs
-        const filterColumn = document.getElementById('filter-column');
-        const filterValue = document.getElementById('filter-value');
-        if (filterColumn) filterColumn.value = '';
-        if (filterValue) filterValue.value = '';
-
-        // Reset sort inputs (assuming you have sort controls in your HTML)
-        const sortColumn = document.getElementById('sort-column');
-        const sortOrder = document.getElementById('sort-order');
-        if (sortColumn) sortColumn.value = 'id'; // Default sort column
-        if (sortOrder) sortOrder.value = 'asc'; // Default sort order
-
-        // Reset content type to 'movie' and letter to 'A'
-        currentContentType = 'movie';
-        currentLetter = 'A';
-
-        // Update the content with default values
-        updateContent("{{ url_for('database.index') }}", {
-            content_type: currentContentType,
-            letter: currentLetter
-        });
-    }
-
-    function setUpdatingContent(isUpdating) {
-        if (isUpdating) {
-            Loading.show();
-        } else {
-            Loading.hide();
-        }
-    }
-
-    function renderTable(items, selectedColumns) {
-        let tableHTML = '<table><thead><tr>';
-        tableHTML += '<th>Select</th>';
-        tableHTML += '<th>Delete</th>';
-        tableHTML += '<th>Rescrape</th>';
-        selectedColumns.forEach(column => {
-            tableHTML += `<th>${column}</th>`;
-        });
-        tableHTML += '</tr></thead><tbody>';
-
-        items.forEach(item => {
-            tableHTML += '<tr>';
-            tableHTML += `<td><input type="checkbox" class="item-select" data-item-id="${item['id']}"></td>`;
-            tableHTML += `<td><button class="delete-item" data-item-id="${item['id']}">X</button></td>`;
-            tableHTML += `<td><button class="rescrape-item" data-item-id="${item['id']}">↻</button></td>`;
-            selectedColumns.forEach(column => {
-                const cellContent = item[column] === null || item[column] === undefined || item[column] === '' 
-                    ? 'None' 
-                    : String(item[column]).replace(/"/g, '&quot;');
-                tableHTML += `<td class="truncate" data-full-content="${cellContent}">${cellContent}</td>`;
-            });
-            tableHTML += '</tr>';
-        });
-
-        tableHTML += '</tbody></table>';
-        return tableHTML;
-    }
-
-    function updateContent(url, params = {}) {
-        // Preserve current states if not explicitly changed
-        params.content_type = params.content_type || currentContentType;
-        params.letter = params.letter || currentLetter;
-
-        // Add default sort parameters if not present
-        if (!params.sort_column) params.sort_column = '{{ sort_column }}';
-        if (!params.sort_order) params.sort_order = '{{ sort_order }}';
-
-        // Add ajax parameter
-        params.ajax = '1';
-
-        const queryString = new URLSearchParams(params).toString();
-        url += '?' + queryString;
-
-        // Set updating content flag to true
-        setUpdatingContent(true);
-
-        fetch(url)
-            .then(response => response.json())
-            .then(data => {
-                if (data.error) {
-                    throw new Error(data.error);
-                }
-                
-                const tableContainer = document.querySelector('.table-container');
-                if (tableContainer) {
-                    tableContainer.innerHTML = data.items.length > 0 
-                        ? renderTable(data.items, data.selected_columns)
-                        : '<p>No items found in the database.</p>';
-                } else {
-                    console.error('Table container not found');
-                }
-
-                const paginationElement = document.querySelector('.pagination');
-                if (paginationElement) {
-                    paginationElement.innerHTML = renderPagination(data);
-                }
-
-                const contentTypeFilterElement = document.querySelector('.content-type-filter');
-                if (contentTypeFilterElement) {
-                    contentTypeFilterElement.innerHTML = renderContentTypeFilter(data);
-                }
-
-                // Update current states
-                currentContentType = data.content_type;
-                currentLetter = data.current_letter;
-
-                // Update UI to reflect current state
-                updateUIForCurrentState(data);
-
-                // Reattach event listeners
-                attachEventListeners();
-                attachDeleteListeners();
-                attachRescrapeListeners();
-
-                // Reinitialize tooltips for the updated content
-                initializeDatabaseTooltips();
-            })
-            .catch(error => {
-                console.error('Error updating content:', error);
-                showPopup({
-                    type: POPUP_TYPES.ERROR,
-                    title: 'Error',
-                    message: 'Failed to update database content: ' + error.message,
-                });
-            })
-            .finally(() => {
-                setUpdatingContent(false);
-            });
-    }
-
-    function renderPagination(data) {
-        if (!data.alphabet || data.alphabet.length === 0) {
-            return '<p>No pagination data available</p>';
-        }
-
-        let paginationHTML = '<a href="#" data-letter="#" class="pagination-link ' + (data.current_letter === '#' ? 'active' : '') + '">#</a>';
-        data.alphabet.forEach(letter => {
-            paginationHTML += '<a href="#" data-letter="' + letter + '" class="pagination-link ' + (letter === data.current_letter ? 'active' : '') + '">' + letter + '</a>';
-        });
-
-        return paginationHTML;
-    }
-
-    function renderContentTypeFilter(data) {
-        return `
-            <a href="#" data-content-type="movie" class="content-type-link ${data.content_type === 'movie' ? 'active' : ''}">Movies</a>
-            <a href="#" data-content-type="episode" class="content-type-link ${data.content_type === 'episode' ? 'active' : ''}">Episodes</a>
-        `;
-    }
-
-    function updateUIForCurrentState(data) {
-        // ... (implement UI update logic)
-    }
-
-    function attachEventListeners() {
-        document.querySelectorAll('.content-type-link').forEach(link => {
-            link.addEventListener('click', function(e) {
-                e.preventDefault();
-                var contentType = this.getAttribute('data-content-type');
-                clearFilter();
-                updateContent('{{ url_for('database.index') }}', { content_type: contentType });
-            });
-        });
-
-        document.querySelectorAll('.pagination-link').forEach(link => {
-            link.addEventListener('click', function(e) {
-                e.preventDefault();
-                var letter = this.getAttribute('data-letter');
-                clearFilter();
-                updateContent('{{ url_for('database.index') }}', { letter: letter });
-            });
-        });
-    }
-
-    function attachDeleteListeners() {
-        document.querySelectorAll('.delete-item').forEach(button => {
-            button.addEventListener('click', function(e) {
-                e.preventDefault();
-                const itemId = this.getAttribute('data-item-id');
-                showDeleteConfirmation(itemId);
-            });
-        });
-    }
-
-    function attachRescrapeListeners() {
-        document.querySelectorAll('.rescrape-item').forEach(button => {
-            button.addEventListener('click', function(e) {
-                e.preventDefault();
-                const itemId = this.getAttribute('data-item-id');
-                showRescrapeConfirmation(itemId);
-            });
-        });
-    }
-
-    function showDeleteConfirmation(itemId) {
-        showPopup({
-            type: POPUP_TYPES.CONFIRM,
-            title: 'Confirm Deletion',
-            message: `
-                <div>Are you sure you want to delete this item?</div>
-                <div style="margin-top: 10px;">
-                    <label>
-                        <input type="checkbox" id="blacklist-item-checkbox"> Blacklist item to avoid re-addition?
-                    </label>
-                </div>
-            `,
-            confirmText: 'Delete',
-            cancelText: 'Cancel',
-            onConfirm: () => {
-                const blacklistItem = document.getElementById('blacklist-item-checkbox').checked;
-                deleteItem(itemId, blacklistItem);
-            },
-            onCancel: () => {} // Do nothing on cancel
-        });
-    }
-
-    function showRescrapeConfirmation(itemId) {
-        showPopup({
-            type: POPUP_TYPES.CONFIRM,
-            title: 'Confirm Rescrape',
-            message: 'Are you sure you want to move this item back to the Wanted queue for rescraping?',
-            confirmText: 'Rescrape',
-            cancelText: 'Cancel',
-            onConfirm: () => rescrapeItem(itemId),
-            onCancel: () => {} // Do nothing on cancel
-        });
-    }
-
-    function deleteItem(itemId, blacklistItem) {
-        Loading.show();
-        fetch('{{ url_for('database.delete_item') }}', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({ 
-                item_id: itemId,
-                blacklist: blacklistItem 
-            })
-        })
-        .then(response => {
-            if (!response.ok) {
-                throw new Error('Network response was not ok');
-            }
-            return response.json();
-        })
-        .then(data => {
-            if (data.success) {
-                // Remove the row from the table
-                const row = document.querySelector(`button[data-item-id="${itemId}"]`).closest('tr');
-                row.remove();
-                // Show success popup
-                showPopup({
-                    type: POPUP_TYPES.SUCCESS,
-                    title: 'Success',
-                    message: 'Item deleted successfully',
-                    autoClose: 3000 // Close after 3 seconds
-                });
-            } else {
-                throw new Error(data.error || 'Unknown error');
-            }
-        })
-        .catch(error => {
-            console.error('Error:', error);
-            // Show error popup
-            showPopup({
-                type: POPUP_TYPES.ERROR,
-                title: 'Error',
-                message: 'An error occurred while deleting the item: ' + error.message,
-            });
-        })
-        .finally(() => {
-            Loading.hide();
-        });
-    }
-
-    function rescrapeItem(itemId) {
-        fetch('{{ url_for('debug.rescrape_item') }}', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({ item_id: itemId })
-        })
-        .then(response => {
-            if (!response.ok) {
-                throw new Error('Network response was not ok');
-            }
-            return response.json();
-        })
-        .then(data => {
-            if (data.success) {
-                // Remove the row from the table
-                const row = document.querySelector(`button[data-item-id="${itemId}"]`).closest('tr');
-                row.remove();
-                // Show success popup
-                showPopup({
-                    type: POPUP_TYPES.SUCCESS,
-                    title: 'Success',
-                    message: 'Item moved to Wanted queue for rescraping',
-                    autoClose: 3000 // Close after 3 seconds
-                });
-            } else {
-                throw new Error(data.error || 'Unknown error');
-            }
-        })
-        .catch(error => {
-            console.error('Error:', error);
-            // Show error popup
-            showPopup({
-                type: POPUP_TYPES.ERROR,
-                title: 'Error',
-                message: 'An error occurred while moving the item to the Wanted queue: ' + error.message,
-            });
-        });
-    }
-
-    function clearFilter() {
-        const filterColumn = document.getElementById('filter-column');
-        const filterValue = document.getElementById('filter-value');
-        if (filterColumn) filterColumn.value = '';
-        if (filterValue) filterValue.value = '';
-    }
-
-    // Add bulk action handlers
-    const selectAllBtn = document.getElementById('select-all');
-    const bulkDeleteBtn = document.getElementById('bulk-delete');
-    const bulkMoveQueue = document.getElementById('bulk-move-queue');
-    const bulkChangeVersion = document.getElementById('bulk-change-version');
-    const bulkEarlyReleaseBtn = document.getElementById('bulk-early-release');
-    let lastChecked = null;
-    let allSelected = false;
-
-    // Fetch available versions and populate the version dropdown
-    fetch('/settings/get_scraping_versions')
-        .then(response => response.json())
-        .then(data => {
-            if (data.versions) {
-                data.versions.forEach(version => {
-                    const option = document.createElement('option');
-                    option.value = version;
-                    option.textContent = version;
-                    bulkChangeVersion.appendChild(option);
-                });
-            }
-        })
-        .catch(error => {
-            console.error('Error fetching versions:', error);
-            showPopup({
-                type: POPUP_TYPES.ERROR,
-                message: 'Failed to load available versions',
-                title: 'Error'
-            });
-        });
-
-    // Handle bulk version change
-    bulkChangeVersion.addEventListener('change', function() {
-        const selectedVersion = this.value;
-        if (!selectedVersion) return;
-
-        const selectedItems = Array.from(document.querySelectorAll('.item-select:checked'))
-            .map(checkbox => checkbox.dataset.itemId);
-        
-        if (selectedItems.length === 0) return;
-
-        showPopup({
-            type: POPUP_TYPES.CONFIRM,
-            message: `Are you sure you want to change the version of ${selectedItems.length} item(s) to ${selectedVersion}?`,
-            title: 'Confirm Version Change',
-            onConfirm: async () => {
-                Loading.show();
-                try {
-                    const result = await processBatchedItems(selectedItems, 'change_version', selectedVersion);
-                    showPopup({
-                        type: result.warning ? POPUP_TYPES.WARNING : POPUP_TYPES.SUCCESS,
-                        message: result.message,
-                        title: result.warning ? 'Partial Success' : 'Success',
-                    });
-                    setTimeout(() => {
-                        window.location.reload();
-                    }, 2000);
-                } catch (error) {
-                    console.error('Error:', error);
-                    showPopup({
-                        type: POPUP_TYPES.ERROR,
-                        message: error.message,
-                        title: 'Error',
-                    });
-                } finally {
-                    Loading.hide();
-                }
-            },
-        });
-        
-        // Reset the select element
-        this.value = '';
-    });
-
-    // Select all functionality
-    selectAllBtn.addEventListener('click', function() {
-        allSelected = !allSelected;
-        const checkboxes = document.querySelectorAll('.item-select');
-        checkboxes.forEach(checkbox => {
-            checkbox.checked = allSelected;
-        });
-        this.textContent = allSelected ? 'Unselect All' : 'Select All';
-        updateBulkActionButtons();
-    });
-
-    // Handle individual checkbox changes
-    document.addEventListener('change', function(e) {
-        if (e.target.classList.contains('item-select')) {
-            updateBulkActionButtons();
-            // Update select all button text based on checkbox state
-            const checkboxes = Array.from(document.querySelectorAll('.item-select'));
-            const allChecked = checkboxes.every(cb => cb.checked);
-            const noneChecked = checkboxes.every(cb => !cb.checked);
-            selectAllBtn.textContent = allChecked ? 'Unselect All' : 'Select All';
-            allSelected = allChecked;
-        }
-    });
-
-    // Handle shift+click for range selection
-    document.addEventListener('click', function(e) {
-        if (e.target.classList.contains('item-select')) {
-            if (!lastChecked) {
-                lastChecked = e.target;
-                return;
-            }
-
-            if (e.shiftKey) {
-                const checkboxes = Array.from(document.querySelectorAll('.item-select'));
-                const start = checkboxes.indexOf(e.target);
-                const end = checkboxes.indexOf(lastChecked);
-                
-                checkboxes.slice(
-                    Math.min(start, end),
-                    Math.max(start, end) + 1
-                ).forEach(checkbox => {
-                    checkbox.checked = lastChecked.checked;
-                });
-            }
-
-            lastChecked = e.target;
-            updateBulkActionButtons();
-        }
-    });
-
-    // Update bulk action button states
-    function updateBulkActionButtons() {
-        const selectedCount = document.querySelectorAll('.item-select:checked').length;
-        bulkDeleteBtn.disabled = selectedCount === 0;
-        bulkMoveQueue.disabled = selectedCount === 0;
-        bulkChangeVersion.disabled = selectedCount === 0;
-        bulkEarlyReleaseBtn.disabled = selectedCount === 0;
-    }
-
-    async function processBatchedItems(items, action, targetQueue = null) {
-        const FRONTEND_BATCH_SIZE = 100; // Process 100 items at a time
-        let totalProcessed = 0;
-        let errors = [];
-
-        for (let i = 0; i < items.length; i += FRONTEND_BATCH_SIZE) {
-            const batch = items.slice(i, i + FRONTEND_BATCH_SIZE);
-            const formData = new FormData();
-            formData.append('action', action);
-            if (targetQueue) {
-                formData.append('target_queue', targetQueue);
-            }
-            
-            batch.forEach(id => {
-                formData.append('selected_items', id);
-            });
-
-            try {
-                const response = await fetch('/database/bulk_queue_action', {
-                    method: 'POST',
-                    body: formData,
-                });
-                const data = await response.json();
-                
-                if (data.success) {
-                    totalProcessed += batch.length;
-                } else {
-                    errors.push(`Batch ${Math.floor(i/FRONTEND_BATCH_SIZE) + 1}: ${data.error}`);
-                }
-            } catch (error) {
-                errors.push(`Batch ${Math.floor(i/FRONTEND_BATCH_SIZE) + 1}: ${error.message}`);
-            }
-        }
-
-        return {
-            success: errors.length === 0,
-            warning: errors.length > 0 && totalProcessed > 0,
-            message: errors.length > 0 
-                ? `Processed ${totalProcessed} items with ${errors.length} batch errors. Errors: ${errors.join('; ')}`
-                : `Successfully processed ${totalProcessed} items`,
-        };
-    }
-
-    // Handle bulk delete
-    bulkDeleteBtn.addEventListener('click', function() {
-        const selectedItems = Array.from(document.querySelectorAll('.item-select:checked'))
-            .map(checkbox => checkbox.dataset.itemId);
-        
-        if (selectedItems.length === 0) return;
-
-        showPopup({
-            type: POPUP_TYPES.CONFIRM,
-            title: 'Confirm Deletion',
-            message: `
-                <div>Are you sure you want to delete ${selectedItems.length} item(s)?</div>
-                <div style="margin-top: 10px;">
-                    <label>
-                        <input type="checkbox" id="bulk-blacklist-checkbox"> Blacklist item to avoid re-addition?
-                    </label>
-                </div>
-            `,
-            confirmText: 'Delete',
-            cancelText: 'Cancel',
-            onConfirm: async () => {
-                Loading.show();
-                const blacklistItems = document.getElementById('bulk-blacklist-checkbox').checked;
-                
-                const formData = new FormData();
-                formData.append('action', 'delete');
-                formData.append('blacklist', blacklistItems);
-                selectedItems.forEach(id => {
-                    formData.append('selected_items', id);
-                });
-
-                try {
-                    const response = await fetch('/database/bulk_queue_action', {
-                        method: 'POST',
-                        body: formData,
-                    });
-                    const data = await response.json();
-                    
-                    showPopup({
-                        type: data.warning ? POPUP_TYPES.WARNING : POPUP_TYPES.SUCCESS,
-                        message: data.message,
-                        title: data.warning ? 'Partial Success' : 'Success',
-                    });
-                    
-                    setTimeout(() => {
-                        window.location.reload();
-                    }, 2000);
-                } catch (error) {
-                    console.error('Error:', error);
-                    showPopup({
-                        type: POPUP_TYPES.ERROR,
-                        message: error.message,
-                        title: 'Error',
-                    });
-                } finally {
-                    Loading.hide();
-                }
-            },
-        });
-    });
-
-    // Handle bulk move to queue
-    bulkMoveQueue.addEventListener('change', function() {
-        const selectedQueue = this.value;
-        if (!selectedQueue) return;
-
-        const selectedItems = Array.from(document.querySelectorAll('.item-select:checked'))
-            .map(checkbox => checkbox.dataset.itemId);
-        
-        if (selectedItems.length === 0) return;
-
-        showPopup({
-            type: POPUP_TYPES.CONFIRM,
-            message: `Are you sure you want to move ${selectedItems.length} item(s) to ${selectedQueue} queue?`,
-            title: 'Confirm Move',
-            onConfirm: async () => {
-                Loading.show();
-                try {
-                    const result = await processBatchedItems(selectedItems, 'move', selectedQueue);
-                    showPopup({
-                        type: result.warning ? POPUP_TYPES.WARNING : POPUP_TYPES.SUCCESS,
-                        message: result.message,
-                        title: result.warning ? 'Partial Success' : 'Success',
-                    });
-                    setTimeout(() => {
-                        window.location.reload();
-                    }, 2000);
-                } catch (error) {
-                    console.error('Error:', error);
-                    showPopup({
-                        type: POPUP_TYPES.ERROR,
-                        message: error.message,
-                        title: 'Error',
-                    });
-                } finally {
-                    Loading.hide();
-                }
-            },
-        });
-        
-        // Reset the select element
-        this.value = '';
-    });
-
-    // Handle bulk early release
-    bulkEarlyReleaseBtn.addEventListener('click', function() {
-        const selectedItems = Array.from(document.querySelectorAll('.item-select:checked'))
-            .map(checkbox => checkbox.dataset.itemId);
-        
-        if (selectedItems.length === 0) return;
-
-        showPopup({
-            type: POPUP_TYPES.CONFIRM,
-            title: 'Confirm Early Release',
-            message: `
-                <div>Are you sure you want to mark ${selectedItems.length} item(s) as early release?</div>
-            `,
-            confirmText: 'Mark',
-            cancelText: 'Cancel',
-            onConfirm: async () => {
-                Loading.show();
-                try {
-                    const result = await processBatchedItems(selectedItems, 'early_release');
-                    showPopup({
-                        type: result.warning ? POPUP_TYPES.WARNING : POPUP_TYPES.SUCCESS,
-                        message: result.message,
-                        title: result.warning ? 'Partial Success' : 'Success',
-                    });
-                    setTimeout(() => {
-                        window.location.reload();
-                    }, 2000);
-                } catch (error) {
-                    console.error('Error:', error);
-                    showPopup({
-                        type: POPUP_TYPES.ERROR,
-                        message: error.message,
-                        title: 'Error',
-                    });
-                } finally {
-                    Loading.hide();
-                }
-            },
-        });
-    });
-
-    // Initial attachment of event listeners
-    attachEventListeners();
-    attachDeleteListeners();
-    attachRescrapeListeners();
-});
-
-Loading.init();
-</script>
+<!-- Custom Confirmation Modal HTML Structure -->
+<div id="confirmationModal" class="fixed inset-0 bg-gray-600 bg-opacity-50 flex items-center justify-center z-50 hidden">
+    <div class="bg-gray-900 rounded-lg shadow-xl p-6 max-w-sm mx-auto border border-gray-700">
+        <h3 class="text-lg leading-6 font-medium text-gray-100" id="modalTitle">Confirm Deletion</h3>
+        <div class="mt-2">
+            <p class="text-sm text-gray-300" id="modalMessage">Are you sure you want to delete this item? This action cannot be undone.</p>
+        </div>
+        <div class="mt-4 flex justify-end space-x-3">
+            <button type="button" id="cancelDeleteBtn" class="inline-flex justify-center px-4 py-2 border border-gray-600 shadow-sm text-sm font-medium rounded-md text-gray-300 bg-gray-700 hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 transition-colors duration-200">
+                Cancel
+            </button>
+            <button type="button" id="confirmDeleteBtn" class="inline-flex justify-center px-4 py-2 border border-transparent shadow-sm text-sm font-medium rounded-md text-white bg-red-600 hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500 transition-colors duration-200">
+                Delete
+            </button>
+        </div>
+    </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+    {{ super() }}
+    <script src="{{ url_for('static', filename='js/database.js') }}"></script>
+    <!-- Assuming you have a base.js or notifications.js for these functions -->
+    <script src="{{ url_for('static', filename='js/notifications.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/loading.js') }}"></script>
 {% endblock %}
